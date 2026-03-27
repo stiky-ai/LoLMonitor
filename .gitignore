@@ -1,0 +1,24 @@
+# Fichiers à ignorer par Git
+
+# Dossiers de build
+build/
+
+# Caches Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Fichiers de préférences utilisateurs
+skin_prefs.json
+tft_prefs.json
+
+# Fichiers générés par PyInstaller
+*.spec
+
+# Autres fichiers temporaires
+*.log
+*.tmp
+
+# VSCode
+.vscode/
