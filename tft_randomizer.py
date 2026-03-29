@@ -23,6 +23,7 @@ LOCKFILE_CANDIDATES = [
 
 AUTO_TFT_RANDOM_ENABLED = True
 SET_NAME = "current"
+ARAM_COMPANION_ID = 67001  # Ribamboule de Poros
 
 last_lobby_state = "OTHER"
 prefs = {}
@@ -286,7 +287,9 @@ def tft_random_worker():
 
         try:
             lobby = requests.get(f"{base_url}/lol-lobby/v2/lobby", headers=headers, verify=False, timeout=4).json()
-            current_is_tft = lobby.get("gameMode") == "TFT" or "tft" in str(lobby).lower()
+            game_mode = str(lobby.get("gameMode", "")).upper()
+            current_is_tft = game_mode == "TFT" or "TFT" in str(lobby).upper()
+            current_is_aram = "ARAM" in game_mode or "ARAM" in str(lobby).upper()
 
             if current_is_tft and last_lobby_state != "TFT":
                 log("→ ENTRÉE FRAÎCHE EN LOBBY TFT → Scan + random...")
@@ -335,8 +338,16 @@ def tft_random_worker():
 
                 last_lobby_state = "TFT"
 
-            elif not current_is_tft and last_lobby_state == "TFT":
-                log("→ Sortie lobby TFT")
+            elif current_is_aram and last_lobby_state != "ARAM":
+                log("→ ENTRÉE FRAÎCHE EN LOBBY ARAM / ARAM MAYHEM → Sélection automatique de Ribamboule de Poros")
+                if apply_random_selection(base_url, headers, "companions", ARAM_COMPANION_ID):
+                    log(f"  → COMPANION APPLIQUÉ : Ribamboule de Poros (ID {ARAM_COMPANION_ID})")
+                else:
+                    log("  → Échec application compagnon ARAM")
+                last_lobby_state = "ARAM"
+
+            elif not current_is_tft and not current_is_aram and last_lobby_state in ("TFT", "ARAM"):
+                log("→ Sortie lobby TFT/ARAM")
                 last_lobby_state = "OTHER"
 
         except Exception as e:

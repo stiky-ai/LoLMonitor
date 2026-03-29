@@ -26,6 +26,9 @@ LOCKFILE_CANDIDATES = [
 ]
 
 AUTO_RANDOM_ENABLED = True
+AUTO_SPELL_SELECTION_ENABLED = True
+SNOWBALL_SPELL_ID = 32  # ID probable de Boule de neige dans l’API LCU
+FLASH_SPELL_ID = 4      # Flash
 # ────────────────────────────────────────────────
 
 last_champ_id = None
@@ -52,6 +55,46 @@ def save_prefs(data):
         log(f"Erreur sauvegarde prefs : {e}")
 
 prefs = load_prefs()
+
+# ====================== SPELLS AUTO-SELECTION ======================
+def apply_summoner_spells(base_url, headers, spell1_id, spell2_id):
+    try:
+        my_sel_resp = requests.get(
+            f"{base_url}/lol-champ-select/v1/session/my-selection",
+            headers=headers, verify=False, timeout=5
+        )
+        if my_sel_resp.status_code != 200:
+            log(f"  → Impossible de lire my-selection (HTTP {my_sel_resp.status_code})")
+            return False
+
+        selection = my_sel_resp.json()
+        payload = selection.copy()
+
+        if "spell1Id" in selection or "spell2Id" in selection:
+            payload["spell1Id"] = spell1_id
+            payload["spell2Id"] = spell2_id
+        elif "summonerSpellOne" in selection and "summonerSpellTwo" in selection:
+            payload["summonerSpellOne"] = {"id": spell1_id}
+            payload["summonerSpellTwo"] = {"id": spell2_id}
+        else:
+            payload["spell1Id"] = spell1_id
+            payload["spell2Id"] = spell2_id
+
+        patch_resp = requests.patch(
+            f"{base_url}/lol-champ-select/v1/session/my-selection",
+            json=payload, headers=headers, verify=False, timeout=5
+        )
+
+        if patch_resp.status_code in (200, 201, 204):
+            log("  → Sorts appliqués : Boule de neige (D) + Flash (F)")
+            return True
+
+        log(f"  → Échec application sorts (HTTP {patch_resp.status_code})")
+        return False
+
+    except Exception as e:
+        log(f"  → Erreur application sorts : {e}")
+        return False
 
 # ====================== UPDATE LIBRARY (corrigé) ======================
 def update_skin_library(base_url, headers, summoner_id):
@@ -263,6 +306,10 @@ def random_skin_worker():
                         log(f"  → ÉCHEC APPLICATION (HTTP {patch_resp.status_code})")
                 else:
                     log("  → Aucun skin sélectionnable")
+
+                if AUTO_SPELL_SELECTION_ENABLED:
+                    if not apply_summoner_spells(base_url, headers, SNOWBALL_SPELL_ID, FLASH_SPELL_ID):
+                        log("  → Échec de la sélection auto des sorts D/F")
         except Exception as e:
             log(f"Erreur dans le polling : {str(e)}")
 
