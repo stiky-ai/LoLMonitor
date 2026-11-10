@@ -35,11 +35,14 @@ def load_prefs():
     if os.path.exists(PREFS_FILE):
         try:
             with open(PREFS_FILE, encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+                data.setdefault("automation_enabled", True)
+                return data
         except Exception as e:
             log(f"Erreur lecture prefs : {e}")
     template = {
         "version": 1,
+        "automation_enabled": True,
         "favorites": {
             "companions": [],
             "map_skins": [],
@@ -60,6 +63,10 @@ def load_prefs():
 
 def save_prefs(data):
     try:
+        if os.path.exists(PREFS_FILE):
+            with open(PREFS_FILE, encoding="utf-8") as f:
+                latest_data = json.load(f)
+            data["automation_enabled"] = latest_data.get("automation_enabled", data.get("automation_enabled", True))
         with open(PREFS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4, ensure_ascii=False)
         log(f"tft_prefs.json sauvegardé ({len(data.get('library', {}))} catégories)")
@@ -263,7 +270,9 @@ def tft_random_worker():
     log("TFT Randomizer démarré")
 
     while True:
-        if not AUTO_TFT_RANDOM_ENABLED:
+        prefs = load_prefs()
+        if not AUTO_TFT_RANDOM_ENABLED or prefs.get("automation_enabled", True) is not True:
+            last_lobby_state = "OTHER"
             time.sleep(5)
             continue
 
@@ -312,7 +321,11 @@ def tft_random_worker():
                     log("→ Inventaire vide")
 
                 # Random unique
+                automation_disabled = False
                 for category in ["companions", "map_skins", "damage_skins", "zoom_skins"]:
+                    if load_prefs().get("automation_enabled", True) is not True:
+                        automation_disabled = True
+                        break
                     items = inventory.get(category, [])
                     if not items:
                         log(f"  → Aucun {category.replace('_', ' ')} possédé")
@@ -331,20 +344,29 @@ def tft_random_worker():
                     item_id = chosen["id"]
                     item_name = chosen["name"]
 
+                    if load_prefs().get("automation_enabled", True) is not True:
+                        automation_disabled = True
+                        break
                     if apply_random_selection(base_url, headers, category, item_id):
                         log(f"  → {category.upper().replace('_', ' ')} APPLIQUÉ : {item_name} (ID {item_id})")
                     else:
                         log(f"  → Échec {category}")
 
+                if automation_disabled:
+                    last_lobby_state = "OTHER"
+                    continue
                 last_lobby_state = "TFT"
 
             elif current_is_aram and last_lobby_state != "ARAM":
                 log("→ ENTRÉE FRAÎCHE EN LOBBY ARAM / ARAM MAYHEM → Sélection automatique de Ribamboule de Poros")
-                if apply_random_selection(base_url, headers, "companions", ARAM_COMPANION_ID):
+                if load_prefs().get("automation_enabled", True) is not True:
+                    last_lobby_state = "OTHER"
+                elif apply_random_selection(base_url, headers, "companions", ARAM_COMPANION_ID):
                     log(f"  → COMPANION APPLIQUÉ : Ribamboule de Poros (ID {ARAM_COMPANION_ID})")
+                    last_lobby_state = "ARAM"
                 else:
                     log("  → Échec application compagnon ARAM")
-                last_lobby_state = "ARAM"
+                    last_lobby_state = "ARAM"
 
             elif not current_is_tft and not current_is_aram and last_lobby_state in ("TFT", "ARAM"):
                 log("→ Sortie lobby TFT/ARAM")

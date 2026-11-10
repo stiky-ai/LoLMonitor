@@ -8,7 +8,17 @@ import requests
 import urllib3
 import json
 import os
-import base64
+import webbrowser
+from threading import Timer
+
+from lol_mastery import (
+    CHAMP_IMAGES as MASTERY_CHAMP_IMAGES,
+    CHAMP_NAMES as MASTERY_CHAMP_NAMES,
+    DD_VERSION as MASTERY_DD_VERSION,
+    MASTERY_HTML,
+    get_gameflow_phase,
+    get_mastery_data,
+)
 
 urllib3.disable_warnings()
 
@@ -16,27 +26,17 @@ app = Flask(__name__)
 
 LOL_PREFS_FILE = "skin_prefs.json"
 TFT_PREFS_FILE = "tft_prefs.json"
-LCU_LOCKFILE_CANDIDATES = [
-    r"C:\Riot Games\League of Legends\lockfile",
-    os.path.expanduser(r"~\AppData\Local\Riot Games\League of Legends\lockfile"),
-]
 
 CHAMP_NAMES = {}
-CHAMP_IMAGES = {}
 DD_VERSION = "latest"
 
 def load_champ_names():
-    global CHAMP_NAMES, CHAMP_IMAGES, DD_VERSION
+    global CHAMP_NAMES, DD_VERSION
     try:
         versions = requests.get("https://ddragon.leagueoflegends.com/api/versions.json").json()
         DD_VERSION = versions[0]
         data = requests.get(f"https://ddragon.leagueoflegends.com/cdn/{DD_VERSION}/data/fr_FR/champion.json").json()
         CHAMP_NAMES = {int(ch["key"]): ch["name"] for ch in data["data"].values()}
-        CHAMP_IMAGES = {
-            int(champion["key"]): champion["image"]["full"]
-            for champion in data["data"].values()
-            if champion.get("image", {}).get("full")
-        }
         print(f"✅ {len(CHAMP_NAMES)} noms de champions chargés ({DD_VERSION})")
     except Exception as e:
         print(f"⚠️ Erreur Data Dragon : {e}")
@@ -50,6 +50,7 @@ def load_prefs(file_path):
                 data = json.load(f)
                 data.setdefault("favorites", {})
                 data.setdefault("library", {})
+                data.setdefault("automation_enabled", True)
                 icon_prefs = data.setdefault("summoner_icon", {})
                 icon_prefs.setdefault("default", None)
                 icon_prefs.setdefault("champion_overrides", {})
@@ -57,22 +58,28 @@ def load_prefs(file_path):
                 return data
         except Exception as e:
             print(f"Erreur lecture {file_path} : {e}")
-            return {"favorites": {}, "library": {}, "summoner_icon": {"default": None, "champion_overrides": {}, "inventory": []}}
+            return {"favorites": {}, "library": {}, "automation_enabled": True, "summoner_icon": {"default": None, "champion_overrides": {}, "inventory": []}}
     print(f"Fichier {file_path} introuvable, template vide retourné")
-    return {"favorites": {}, "library": {}, "summoner_icon": {"default": None, "champion_overrides": {}, "inventory": []}}
+    return {"favorites": {}, "library": {}, "automation_enabled": True, "summoner_icon": {"default": None, "champion_overrides": {}, "inventory": []}}
 
 def save_prefs(data, file_path):
     try:
+        data.setdefault("automation_enabled", True)
         with open(file_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4, ensure_ascii=False)
         print(f"{file_path} sauvegardé")
+        return True
     except Exception as e:
         print(f"Erreur sauvegarde {file_path} : {e}")
+        return False
 
 MAIN_HTML = """
 <!DOCTYPE html>
-<html>
+<html lang="fr">
 <head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#020617">
 <title>LoL/TFT HUD</title>
 <style>
 body {background:#020617;color:white;font-family:Arial,sans-serif;margin:0;}
@@ -83,6 +90,12 @@ h1 {margin:10px 0;font-size:2.4rem;}
 .nav-btn {padding:12px 24px;margin:0 10px;font-size:1.2rem;border:none;border-radius:10px;cursor:pointer;background:#334155;color:white;}
 .nav-btn.active {background:#1e40af;}
 .nav-btn:hover {background:#475569;}
+.automation-controls {display:flex;justify-content:center;flex-wrap:wrap;gap:12px;margin:12px 0;}
+.automation-control {display:flex;align-items:center;gap:10px;padding:8px 14px;border:1px solid #334155;border-radius:10px;background:#0f172a;color:#cbd5e1;}
+.automation-control input {width:18px;height:18px;margin:0;accent-color:#22c55e;}
+.automation-control .automation-state {min-width:34px;color:#22c55e;font-weight:700;}
+.automation-control .automation-state.off {color:#f87171;}
+#automation-error {min-height:1.2em;color:#fca5a5;}
 .container {display:flex;justify-content:space-between;padding:0 20px;gap:30px;width:100%;box-sizing:border-box;}
 .team {width:48%;background:#0f172a;padding:18px;border-radius:14px;box-shadow:0 4px 15px rgba(0,0,0,0.5);}
 .player {background:#1e293b;margin:12px 0;padding:14px;border-radius:10px;}
@@ -99,39 +112,10 @@ h1 {margin:10px 0;font-size:2.4rem;}
 .gold-green {color: #22c55e !important;}
 .gold-red {color: #ef4444 !important;}
 #lol-settings, #tft-settings {display:none;padding:30px;background:#0f172a;border-radius:14px;margin:25px;}
-#mastery-settings {display:none;padding:30px;background:#0f172a;border-radius:14px;margin:25px;}
+#mastery-settings {display:none;width:100%;max-width:none;margin:0;padding:0;border:0;border-radius:0;background:transparent;box-shadow:none;}
 .search {width:100%;padding:16px;margin-bottom:25px;background:#1e293b;border:none;border-radius:12px;color:white;font-size:1.15rem;box-sizing:border-box;}
-#lol-prefs-list, #tft-prefs-list, #mastery-list {display:grid;grid-template-columns:repeat(auto-fill, minmax(300px, 1fr));gap:20px;}
+#lol-prefs-list, #tft-prefs-list {display:grid;grid-template-columns:repeat(auto-fill, minmax(380px, 1fr));gap:20px;}
 .champ-card, .tft-card {background:#1e293b;border-radius:12px;overflow:hidden;box-shadow:0 4px 15px rgba(0,0,0,0.5);}
-.mastery-card {background:#1e293b;border:1px solid #334155;border-radius:12px;padding:16px;box-shadow:0 4px 15px rgba(0,0,0,0.35);}
-.mastery-card.close-to-level {border:2px solid #facc15;box-shadow:0 0 0 2px rgba(250,204,21,0.18);}
-.mastery-card.max-level {border-color:#64748b;}
-.mastery-card-header {display:flex;align-items:center;gap:14px;}
-.mastery-card-header img {width:64px;height:64px;border:1px solid #475569;border-radius:10px;object-fit:cover;}
-.mastery-card h3 {margin:0;color:#93c5fd;}
-.mastery-summary {display:flex;align-items:center;justify-content:space-between;gap:12px;}
-.mastery-title {display:flex;align-items:center;gap:12px;min-width:0;}
-.mastery-title h3 {overflow-wrap:anywhere;}
-.mastery-title.unknown-champion h3 {color:#cbd5e1;}
-.mastery-missing-image {display:grid;place-items:center;width:64px;height:64px;flex-shrink:0;border:1px dashed #64748b;border-radius:10px;background:#0f172a;color:#94a3b8;font-size:1.6rem;}
-.mastery-toggle {display:flex;align-items:center;gap:8px;flex-shrink:0;padding:8px 10px;border:1px solid #475569;border-radius:8px;background:#0f172a;color:#cbd5e1;cursor:pointer;}
-.mastery-toggle:hover {background:#334155;color:white;}
-.mastery-toggle:focus-visible {outline:2px solid #38bdf8;outline-offset:2px;}
-.mastery-chevron {width:14px;height:14px;transition:transform .18s ease;}
-.mastery-toggle[aria-expanded="true"] .mastery-chevron {transform:rotate(180deg);}
-.mastery-details {margin-top:14px;padding-top:10px;border-top:1px solid #334155;}
-.mastery-level {flex-shrink:0;padding:5px 9px;border-radius:999px;background:#1e3a8a;color:#bfdbfe;font-size:.9rem;font-weight:700;}
-.mastery-card p {margin:8px 0;color:#e2e8f0;}
-.mastery-badge {display:inline-block;margin-bottom:8px;padding:4px 9px;border-radius:999px;background:#713f12;color:#fde68a;font-size:.85rem;font-weight:700;}
-.mastery-controls {display:flex;flex-wrap:wrap;gap:14px;align-items:end;margin:16px 0;}
-.mastery-controls label {display:flex;flex-direction:column;gap:6px;color:#cbd5e1;}
-.mastery-controls .mastery-checkbox-label {flex-direction:row;align-items:center;gap:8px;}
-.mastery-controls select,.mastery-controls input {padding:10px;border:1px solid #334155;border-radius:8px;background:#020617;color:white;}
-.mastery-controls input[type="checkbox"] {width:18px;height:18px;margin:0;padding:0;accent-color:#38bdf8;}
-.mastery-controls button {padding:10px 16px;border:0;border-radius:8px;background:#2563eb;color:white;cursor:pointer;}
-.mastery-controls .mastery-expand-button {background:#334155;}
-.mastery-controls .mastery-expand-button:hover {background:#475569;}
-.mastery-status {margin:12px 0;color:#cbd5e1;}
 .card-header {background:#0f172a;padding:16px 20px;font-size:1.35rem;font-weight:bold;color:#60a5fa;border-bottom:1px solid #334155;}
 .grid-container {padding:12px;display:grid;grid-template-columns:repeat(auto-fit, minmax(160px, 1fr));gap:12px;}
 .item, .skin-item {display:flex;justify-content:space-between;align-items:center;background:#0f172a;padding:10px 14px;border-radius:8px;font-size:1.05rem;}
@@ -159,16 +143,89 @@ h1 {margin:10px 0;font-size:2.4rem;}
 .champ-suggestion:hover, .champ-suggestion.selected {background:#1e293b;color:#ffffff;}
 .selected-champ-box {padding:16px;border-radius:14px;background:#0f172a;min-height:180px;display:flex;flex-direction:column;justify-content:space-between;}
 .selected-champ-box .meta {color:#cbd5e1;line-height:1.6;}
+* {box-sizing:border-box;}
+body {min-width:320px;background:radial-gradient(ellipse at top,#172b46 0,#020617 55%);font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;}
+.header {position:relative;padding:24px clamp(14px,4vw,48px) 18px;background:linear-gradient(180deg,rgba(15,23,42,.96),rgba(2,6,23,.82));border-bottom:1px solid #1e293b;}
+h1 {margin:0 0 16px;font-size:clamp(1.7rem,4vw,2.4rem);letter-spacing:-.04em;}
+.automation-controls {gap:10px;margin:0 auto 12px;max-width:740px;}
+.automation-control {flex:1 1 260px;min-width:0;justify-content:center;gap:12px;padding:10px 14px;background:rgba(15,23,42,.9);transition:border-color .18s,background .18s;}
+.automation-control:has(input:checked) {border-color:#166534;background:rgba(6,78,59,.28);}
+.automation-control input {appearance:none;position:relative;flex:none;width:38px;height:22px;border:1px solid #475569;border-radius:999px;background:#334155;cursor:pointer;transition:background .18s,border-color .18s;}
+.automation-control input::after {position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#cbd5e1;content:"";transition:transform .18s,background .18s;}
+.automation-control input:checked {border-color:#10b981;background:#047857;}
+.automation-control input:checked::after {transform:translateX(16px);background:#fff;}
+.automation-control input:disabled {cursor:wait;opacity:.65;}
+.automation-control input:focus-visible {outline:2px solid #38bdf8;outline-offset:3px;}
+.automation-control .automation-state {min-width:34px;text-align:center;}
+#automation-error {max-width:740px;margin:0 auto;color:#fca5a5;font-size:.84rem;}
+.nav-buttons {display:flex;justify-content:center;flex-wrap:wrap;gap:8px;margin:14px auto 0;}
+.nav-btn {margin:0;padding:10px 16px;border:1px solid #334155;font-size:.96rem;font-weight:700;transition:background .18s,border-color .18s,transform .18s;}
+.nav-btn:hover {transform:translateY(-1px);border-color:#475569;}
+.nav-btn.active {border-color:#3b82f6;background:#1d4ed8;}
+button:focus-visible,input:focus-visible,select:focus-visible {outline:2px solid #38bdf8;outline-offset:3px;}
+#monitoring {justify-content:center;align-items:flex-start;max-width:1480px;margin:0 auto;padding:24px clamp(12px,3vw,32px);gap:18px;}
+.team {width:auto;min-width:0;flex:1 1 0;border:1px solid #1e293b;box-shadow:0 16px 40px rgba(0,0,0,.24);}
+#lol-settings,#tft-settings,#icon-settings {width:calc(100% - 32px);max-width:1480px;margin:20px auto;padding:clamp(16px,3vw,30px);border:1px solid #1e293b;box-shadow:0 16px 40px rgba(0,0,0,.2);}
+#lol-prefs-list,#tft-prefs-list {grid-template-columns:repeat(auto-fill,minmax(min(100%,300px),1fr));gap:16px;}
+.champ-card,.tft-card,.icon-card {min-width:0;border:1px solid #334155;box-shadow:0 10px 28px rgba(0,0,0,.18);}
+.card-header {padding:14px 16px;font-size:1.08rem;overflow-wrap:anywhere;}
+.grid-container {grid-template-columns:repeat(auto-fit,minmax(min(100%,180px),1fr));}
+.item,.skin-item {min-width:0;gap:8px;padding:10px 12px;font-size:.96rem;}
+.item-name,.skin-name {min-width:0;overflow-wrap:anywhere;}
+.heart {flex:none;padding:4px 8px;}
+.selection-toolbar {gap:8px;}
+.icon-override-form > div {min-width:min(100%,260px)!important;}
+.search {margin-bottom:18px;font-size:1rem;}
+@media (max-width: 760px) {
+    .header {padding:20px 14px 16px;}
+    .automation-controls {gap:8px;margin-bottom:10px;}
+    .automation-control {flex-basis:100%;justify-content:flex-start;padding:10px 12px;}
+    .nav-buttons {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;}
+    .nav-btn {width:100%;padding:11px 8px;font-size:.9rem;}
+    #monitoring {flex-direction:column;padding:14px 10px;gap:12px;}
+    .team {width:100%;flex:none;padding:14px;}
+    #lol-settings,#tft-settings,#icon-settings {width:calc(100% - 20px);margin:10px;padding:16px;}
+    #lol-prefs-list,#tft-prefs-list {grid-template-columns:repeat(auto-fill,minmax(min(100%,260px),1fr));gap:12px;}
+    .selection-toolbar {align-items:stretch;}
+    .selection-toolbar .nav-btn {width:auto;flex:1 1 150px;}
+    .icon-override-form {flex-direction:column;}
+    .icon-override-form > div {width:100%;min-width:0!important;}
+}
+@media (max-width: 420px) {
+    .nav-btn {padding:10px 6px;font-size:.84rem;}
+    #monitoring {padding:10px 8px;}
+    .team {padding:11px;}
+    .team-header {font-size:1.35rem;}
+    .player {margin:9px 0;padding:11px;}
+    #lol-settings,#tft-settings,#icon-settings {width:calc(100% - 16px);padding:12px;}
+    .grid-container {grid-template-columns:1fr;padding:9px;gap:8px;}
+    .card-header {padding:12px;}
+    .icon-card {padding:12px;}
+    .icon-card .icon-actions button {max-width:100%;font-size:.85rem;}
+}
 </style>
 </head>
 <body>
 <div class="header">
     <h1>LoL/TFT HUD</h1>
+    <div class="automation-controls" aria-label="Automatismes">
+        <label class="automation-control" for="lol-automation">
+            <input id="lol-automation" type="checkbox" checked disabled onchange="setAutomation('lol', this.checked)">
+            <span>Automatisme LoL</span>
+            <span id="lol-automation-state" class="automation-state">ON</span>
+        </label>
+        <label class="automation-control" for="tft-automation">
+            <input id="tft-automation" type="checkbox" checked disabled onchange="setAutomation('tft', this.checked)">
+            <span>Automatisme TFT</span>
+            <span id="tft-automation-state" class="automation-state">ON</span>
+        </label>
+    </div>
+    <div id="automation-error" role="status" aria-live="polite"></div>
     <div class="nav-buttons">
-        <button class="nav-btn active" onclick="showSection('monitoring')">Monitoring Game</button>
-        <button class="nav-btn" onclick="showSection('lol-settings')">LoL Skins</button>
-        <button class="nav-btn" onclick="showSection('mastery-settings')">Maîtrise</button>
-        <button class="nav-btn" onclick="showSection('tft-settings')">TFT Random</button>
+        <button class="nav-btn active" onclick="showSection('monitoring', this)">Monitoring Game</button>
+        <button class="nav-btn" onclick="showSection('lol-settings', this)">LoL Skins</button>
+        <button class="nav-btn" onclick="showSection('mastery-settings', this)">Maîtrise</button>
+        <button class="nav-btn" onclick="showSection('tft-settings', this)">TFT Random</button>
     </div>
 </div>
 
@@ -186,34 +243,14 @@ h1 {margin:10px 0;font-size:2.4rem;}
     <div id="lol-prefs-list"></div>
 </div>
 
-<div id="mastery-settings">
-    <h2>Maîtrise des champions</h2>
-    <p>Maîtrises du compte connecté au client LoL. La liste est triée par XP restante; les champions proches du prochain niveau sont mis en évidence. Les IDs sans correspondance dans Data Dragon sont masqués par défaut.</p>
-    <div class="mastery-controls">
-        <label for="mastery-level-filter">Niveau de maîtrise
-            <select id="mastery-level-filter" onchange="renderMastery()">
-                <option value="">Tous les niveaux</option>
-            </select>
-        </label>
-        <label class="mastery-checkbox-label" for="mastery-show-unknown">
-            <input id="mastery-show-unknown" type="checkbox" onchange="renderMastery()">
-            Afficher les IDs non reconnus
-        </label>
-        <label for="mastery-xp-threshold">Seuil de proximité (XP restantes)
-            <input id="mastery-xp-threshold" type="number" min="0" step="100" value="1000" oninput="renderMastery()">
-        </label>
-        <button class="mastery-expand-button" type="button" onclick="setMasteryDetailsExpanded(true)">Tout développer</button>
-        <button class="mastery-expand-button" type="button" onclick="setMasteryDetailsExpanded(false)">Tout réduire</button>
-        <button onclick="loadMastery()">Actualiser</button>
-    </div>
-    <div id="mastery-status" class="mastery-status" role="status">Cliquez sur « Actualiser » pour charger les maîtrises.</div>
-    <div id="mastery-list"></div>
-</div>
-
 <div id="tft-settings">
     <h2>⚙️ TFT Random Preferences</h2>
     <input type="text" id="tft-search" class="search" placeholder="🔎 Filtrer par catégorie..." onkeyup="filterTFT()">
     <div id="tft-prefs-list"></div>
+</div>
+
+<div id="mastery-settings">
+    <div id="mastery-content" role="region" aria-label="Maîtrises LoL">Chargement des maîtrises…</div>
 </div>
 
 <div id="icon-settings" style="display:none;padding:30px;background:#0f172a;border-radius:14px;margin:25px;">
@@ -246,170 +283,102 @@ h1 {margin:10px 0;font-size:2.4rem;}
 
 <script>
 // Navigation
-function showSection(sectionId) {
+let masteryViewLoaded = false;
+let masteryViewLoading = false;
+
+async function loadMasteryView() {
+    if (masteryViewLoaded || masteryViewLoading) return;
+    masteryViewLoading = true;
+    const container = document.getElementById("mastery-content");
+    container.textContent = "Chargement des maîtrises…";
+    try {
+        const response = await fetch("/mastery-panel", {cache: "no-store"});
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const page = new DOMParser().parseFromString(await response.text(), "text/html");
+        const style = page.querySelector("style");
+        const root = page.getElementById("mastery-root");
+        const script = page.querySelector("script");
+        if (!style || !root || !script) throw new Error("La vue Maîtrise est incomplète.");
+
+        root.querySelector("header")?.remove();
+        const scopedStyles = document.createElement("style");
+        scopedStyles.textContent = style.textContent;
+        document.head.append(scopedStyles);
+        container.replaceChildren(root);
+        const activeScript = document.createElement("script");
+        activeScript.textContent = script.textContent;
+        document.body.append(activeScript);
+        masteryViewLoaded = true;
+    } catch (error) {
+        container.textContent = `Impossible de charger les maîtrises : ${error.message}`;
+        console.error("Erreur chargement de la vue Maîtrise :", error);
+    } finally {
+        masteryViewLoading = false;
+    }
+}
+
+function showSection(sectionId, button) {
     document.querySelectorAll('.nav-btn').forEach(btn => btn.classList.remove('active'));
-    event.target.classList.add('active');
+    button.classList.add('active');
 
     document.getElementById('monitoring-view').style.display = sectionId === 'monitoring' ? 'block' : 'none';
     document.getElementById('lol-settings').style.display = sectionId === 'lol-settings' ? 'block' : 'none';
-    document.getElementById('mastery-settings').style.display = sectionId === 'mastery-settings' ? 'block' : 'none';
     document.getElementById('tft-settings').style.display = sectionId === 'tft-settings' ? 'block' : 'none';
+    document.getElementById('mastery-settings').style.display = sectionId === 'mastery-settings' ? 'block' : 'none';
     document.getElementById('icon-settings').style.display = sectionId === 'icon-settings' ? 'block' : 'none';
 
     if (sectionId === 'lol-settings') loadLoLPrefs();
-    if (sectionId === 'mastery-settings') loadMastery();
     if (sectionId === 'tft-settings') loadTFTPrefs();
+    if (sectionId === 'mastery-settings') loadMasteryView();
     if (sectionId === 'icon-settings') loadIconPrefs();
 }
 
-let masteryChampions = [];
-let visibleMasteryChampions = [];
-const expandedMasteryChampions = new Set();
-let masteryLoaded = false;
-
-function escapeHtml(value) {
-    return String(value).replace(/[&<>"']/g, char => ({
-        '&': '&amp;',
-        '<': '&lt;',
-        '>': '&gt;',
-        '"': '&quot;',
-        "'": '&#39;'
-    })[char]);
+function updateAutomationControl(game, enabled) {
+    const input = document.getElementById(`${game}-automation`);
+    const state = document.getElementById(`${game}-automation-state`);
+    input.checked = enabled;
+    state.textContent = enabled ? "ON" : "OFF";
+    state.classList.toggle("off", !enabled);
 }
 
-async function loadMastery() {
-    const status = document.getElementById("mastery-status");
-    const list = document.getElementById("mastery-list");
-    masteryLoaded = false;
-    status.textContent = "Chargement des maîtrises...";
-    list.innerHTML = "";
-
+async function loadAutomationStates() {
+    const error = document.getElementById("automation-error");
     try {
-        const response = await fetch('/mastery');
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
-        if (!Array.isArray(data.champions)) throw new Error("Format de réponse des maîtrises invalide.");
+        const response = await fetch("/automation-settings");
+        const states = await response.json();
+        if (!response.ok) throw new Error(states.error || `HTTP ${response.status}`);
+        updateAutomationControl("lol", states.lol);
+        updateAutomationControl("tft", states.tft);
+        document.getElementById("lol-automation").disabled = false;
+        document.getElementById("tft-automation").disabled = false;
+        error.textContent = "";
+    } catch (e) {
+        error.textContent = `Impossible de lire les automatismes : ${e.message}`;
+        console.error("Erreur lecture automatismes :", e);
+    }
+}
 
-        masteryChampions = data.champions;
-        masteryLoaded = true;
-
-        const levelFilter = document.getElementById("mastery-level-filter");
-        const previousLevel = levelFilter.value;
-        const levels = [...new Set(masteryChampions.map(champion => champion.championLevel))].sort((a, b) => a - b);
-        levelFilter.innerHTML = '<option value="">Tous les niveaux</option>';
-        levels.forEach(level => {
-            const option = document.createElement("option");
-            option.value = String(level);
-            option.textContent = `Niveau ${level}`;
-            levelFilter.appendChild(option);
+async function setAutomation(game, enabled) {
+    const input = document.getElementById(`${game}-automation`);
+    const error = document.getElementById("automation-error");
+    input.disabled = true;
+    try {
+        const response = await fetch("/set_automation", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({game, enabled})
         });
-        if (levels.includes(Number(previousLevel))) levelFilter.value = previousLevel;
-
-        status.textContent = `${masteryChampions.length} maîtrises chargées.`;
-        renderMastery();
-    } catch (error) {
-        masteryLoaded = false;
-        status.textContent = `Impossible de charger les maîtrises : ${error.message}`;
-        list.innerHTML = "";
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+        updateAutomationControl(game, result.enabled);
+        error.textContent = "";
+    } catch (e) {
+        updateAutomationControl(game, !enabled);
+        error.textContent = `Impossible de sauvegarder l'automatisme : ${e.message}`;
+        console.error("Erreur sauvegarde automatisme :", e);
+    } finally {
+        input.disabled = false;
     }
-}
-
-function renderMastery() {
-    if (!masteryLoaded) return;
-
-    const levelFilter = document.getElementById("mastery-level-filter").value;
-    const showUnknown = document.getElementById("mastery-show-unknown").checked;
-    const thresholdInput = document.getElementById("mastery-xp-threshold");
-    const threshold = Math.max(0, Number(thresholdInput.value) || 0);
-    const hiddenUnknownCount = masteryChampions.filter(champion => !champion.isRecognized).length;
-    const champions = masteryChampions
-        .filter(champion => showUnknown || champion.isRecognized)
-        .filter(champion => !levelFilter || champion.championLevel === Number(levelFilter))
-        .sort((a, b) => {
-            if (a.hasNextLevel !== b.hasNextLevel) return a.hasNextLevel ? -1 : 1;
-            if (!a.hasNextLevel) return a.name.localeCompare(b.name);
-            return a.xpRemaining - b.xpRemaining || a.name.localeCompare(b.name);
-        });
-    visibleMasteryChampions = champions;
-
-    const status = document.getElementById("mastery-status");
-    const list = document.getElementById("mastery-list");
-    if (champions.length === 0) {
-        status.textContent = showUnknown
-            ? "Aucune maîtrise pour ce filtre."
-            : `Aucune maîtrise pour ce filtre.${hiddenUnknownCount ? ` ${hiddenUnknownCount} ID(s) non reconnu(s) sont masqué(s).` : ""}`;
-        list.innerHTML = "";
-        return;
-    }
-
-    const hiddenUnknownMessage = !showUnknown && hiddenUnknownCount
-        ? ` ${hiddenUnknownCount} ID(s) non reconnu(s) masqué(s).`
-        : "";
-    status.textContent = `${champions.length} entrée(s) affichée(s).${hiddenUnknownMessage} Le cadre jaune signale ${threshold} XP ou moins avant le prochain niveau.`;
-    list.innerHTML = champions.map(champion => {
-        const isClose = champion.hasNextLevel && champion.xpRemaining <= threshold;
-        const isExpanded = expandedMasteryChampions.has(String(champion.championId));
-        const classes = ["mastery-card"];
-        if (isClose) classes.push("close-to-level");
-        if (!champion.hasNextLevel) classes.push("max-level");
-
-        const progress = champion.hasNextLevel
-            ? `<p>XP restantes : <strong>${champion.xpRemaining.toLocaleString('fr-FR')} XP</strong></p>`
-            : '<p>Niveau maximal atteint · aucun niveau suivant</p>';
-        const marks = champion.markRequiredForNextLevel > 0 || champion.tokensEarned > 0
-            ? `<p>Jetons / marques de maîtrise : ${champion.tokensEarned} disponible(s) / ${champion.markRequiredForNextLevel} requis(s)</p>`
-            : "";
-        const badge = isClose ? `<span class="mastery-badge">Proche du niveau suivant</span>` : "";
-        const detailsId = `mastery-details-${champion.championId}`;
-
-        const imageUrl = champion.image ? escapeHtml(champion.image) : "";
-        const championImage = imageUrl
-            ? `<img src="${imageUrl}" alt="${escapeHtml(champion.name)}" loading="lazy">`
-            : `<span class="mastery-missing-image" aria-hidden="true">?</span>`;
-        const titleClasses = champion.isRecognized ? "mastery-title" : "mastery-title unknown-champion";
-
-        return `<article class="${classes.join(' ')}">
-            ${badge}
-            <div class="mastery-summary">
-                <div class="${titleClasses}">
-                    ${championImage}
-                    <h3>${escapeHtml(champion.name)}</h3>
-                </div>
-                <span class="mastery-level">Niveau ${champion.championLevel}</span>
-                <button class="mastery-toggle" type="button" aria-expanded="${isExpanded}" aria-controls="${detailsId}" onclick="toggleMasteryDetails(${champion.championId})">
-                    <svg class="mastery-chevron" viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 6 4.5 4 4.5-4" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8"/></svg>
-                    <span>${isExpanded ? "Réduire" : "Détails"}</span>
-                </button>
-            </div>
-            <div class="mastery-details" id="${detailsId}" ${isExpanded ? "" : "hidden"}>
-                ${progress}
-                ${marks}
-                <p>Points de maîtrise : ${champion.championPoints.toLocaleString('fr-FR')}</p>
-            </div>
-        </article>`;
-    }).join("");
-}
-
-function toggleMasteryDetails(championId) {
-    const key = String(championId);
-    if (expandedMasteryChampions.has(key)) {
-        expandedMasteryChampions.delete(key);
-    } else {
-        expandedMasteryChampions.add(key);
-    }
-    renderMastery();
-}
-
-function setMasteryDetailsExpanded(expanded) {
-    visibleMasteryChampions.forEach(champion => {
-        const key = String(champion.championId);
-        if (expanded) {
-            expandedMasteryChampions.add(key);
-        } else {
-            expandedMasteryChampions.delete(key);
-        }
-    });
-    renderMastery();
 }
 
 let timers = {};
@@ -485,6 +454,7 @@ async function updateHUD(){
 
 setInterval(updateHUD, 1500);
 updateHUD();
+loadAutomationStates();
 
 // LoL Skins (inchangé)
 let lolChampions = [];
@@ -1064,93 +1034,25 @@ def index():
 def data():
     return jsonify(get_game_data())
 
+@app.route("/mastery-panel")
+def mastery_panel():
+    return MASTERY_HTML
+
 @app.route("/mastery")
-def mastery():
-    lock_path = next((path for path in LCU_LOCKFILE_CANDIDATES if os.path.isfile(path)), None)
-    if not lock_path:
-        return jsonify({"error": "Client LoL introuvable. Ouvre le client et connecte-toi pour charger les maîtrises."}), 503
-
-    try:
-        with open(lock_path, "r", encoding="utf-8") as lockfile:
-            parts = lockfile.read().strip().split(":")
-    except OSError:
-        return jsonify({"error": "Impossible de lire le fichier lockfile du client LoL."}), 503
-
-    if len(parts) < 5 or parts[4] not in ("http", "https"):
-        return jsonify({"error": "Le fichier lockfile du client LoL est invalide."}), 503
-
-    try:
-        port = int(parts[2])
-    except ValueError:
-        return jsonify({"error": "Le port du client LoL dans le lockfile est invalide."}), 503
-    if not 1 <= port <= 65535:
-        return jsonify({"error": "Le port du client LoL dans le lockfile est invalide."}), 503
-
-    auth_raw = f"riot:{parts[3]}"
-    auth_encoded = base64.b64encode(auth_raw.encode("utf-8")).decode("ascii")
-    headers = {
-        "Authorization": f"Basic {auth_encoded}",
-        "User-Agent": "LeagueOfLegendsClient",
-        "Accept": "application/json",
-    }
-
-    try:
-        response = requests.get(
-            f"{parts[4]}://127.0.0.1:{port}/lol-champion-mastery/v1/local-player/champion-mastery",
-            headers=headers,
-            verify=False,
-            timeout=5,
-        )
-    except requests.RequestException:
-        return jsonify({"error": "Impossible de joindre le client LoL. Vérifie qu'il est ouvert et connecté."}), 503
-
-    if response.status_code != 200:
-        return jsonify({"error": f"Le client LoL a refusé la lecture des maîtrises (HTTP {response.status_code})."}), 502
-
-    try:
-        mastery_data = response.json()
-    except ValueError:
-        return jsonify({"error": "Le client LoL a renvoyé des données de maîtrise invalides."}), 502
-
-    if not isinstance(mastery_data, list):
-        return jsonify({"error": "Le format des données de maîtrise renvoyées par le client est invalide."}), 502
-
-    champions = []
-    required_fields = (
-        "championId",
-        "championLevel",
-        "championPoints",
-        "championPointsUntilNextLevel",
-        "markRequiredForNextLevel",
-        "tokensEarned",
+def mastery_data():
+    payload, status = get_mastery_data(
+        MASTERY_CHAMP_NAMES, MASTERY_CHAMP_IMAGES, MASTERY_DD_VERSION
     )
-    for mastery_data_item in mastery_data:
-        if not isinstance(mastery_data_item, dict) or any(
-            not isinstance(mastery_data_item.get(field), int) or isinstance(mastery_data_item.get(field), bool)
-            for field in required_fields
-        ):
-            return jsonify({"error": "Une entrée de maîtrise renvoyée par le client est invalide."}), 502
+    response = jsonify(payload)
+    response.headers["Cache-Control"] = "no-store"
+    return response, status
 
-        champion_id = mastery_data_item["championId"]
-        xp_until_next_level = mastery_data_item["championPointsUntilNextLevel"]
-        marks_required = max(0, mastery_data_item["markRequiredForNextLevel"])
-        tokens_earned = max(0, mastery_data_item["tokensEarned"])
-        has_next_level = xp_until_next_level > 0 or marks_required > 0
-
-        champions.append({
-            "championId": champion_id,
-            "name": CHAMP_NAMES.get(champion_id, f"ID LCU non reconnu ({champion_id})"),
-            "isRecognized": champion_id in CHAMP_NAMES,
-            "image": f"https://ddragon.leagueoflegends.com/cdn/{DD_VERSION}/img/champion/{CHAMP_IMAGES[champion_id]}" if champion_id in CHAMP_IMAGES else None,
-            "championLevel": mastery_data_item["championLevel"],
-            "championPoints": mastery_data_item["championPoints"],
-            "xpRemaining": max(0, xp_until_next_level) if has_next_level else None,
-            "hasNextLevel": has_next_level,
-            "markRequiredForNextLevel": marks_required,
-            "tokensEarned": tokens_earned,
-        })
-
-    return jsonify({"champions": champions})
+@app.route("/gameflow-phase")
+def mastery_gameflow_phase():
+    payload, status = get_gameflow_phase()
+    response = jsonify(payload)
+    response.headers["Cache-Control"] = "no-store"
+    return response, status
 
 @app.route("/prefs")
 def prefs():
@@ -1176,6 +1078,58 @@ def prefs():
     except Exception as e:
         print(f"Erreur route /prefs ({prefs_type}): {e}")
         return jsonify({"error": str(e)}), 500
+
+@app.route("/set_automation", methods=["POST"])
+def set_automation():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Corps JSON invalide"}), 400
+
+    game = data.get("game")
+    enabled = data.get("enabled")
+    if game not in ("lol", "tft") or not isinstance(enabled, bool):
+        return jsonify({"error": "game doit être lol ou tft et enabled doit être booléen"}), 400
+
+    file_path = LOL_PREFS_FILE if game == "lol" else TFT_PREFS_FILE
+    try:
+        prefs_data = load_automation_prefs(file_path)
+        prefs_data["automation_enabled"] = enabled
+        if not save_prefs(prefs_data, file_path):
+            return jsonify({"error": f"Impossible de sauvegarder {file_path}"}), 500
+    except (OSError, ValueError) as e:
+        print(f"Erreur mise à jour des automatismes ({game}) : {e}")
+        return jsonify({"error": f"Impossible de lire ou mettre à jour {file_path}"}), 500
+    return jsonify({"game": game, "enabled": enabled})
+
+@app.route("/automation-settings")
+def automation_settings():
+    try:
+        lol_prefs = load_automation_prefs(LOL_PREFS_FILE)
+        tft_prefs = load_automation_prefs(TFT_PREFS_FILE)
+        return jsonify({
+            "lol": lol_prefs.get("automation_enabled", True),
+            "tft": tft_prefs.get("automation_enabled", True),
+        })
+    except (OSError, ValueError) as e:
+        print(f"Erreur lecture des automatismes : {e}")
+        return jsonify({"error": "Impossible de lire les préférences d’automatisation."}), 500
+
+def load_automation_prefs(file_path):
+    if not os.path.exists(file_path):
+        return {
+            "favorites": {},
+            "library": {},
+            "automation_enabled": True,
+            "summoner_icon": {"default": None, "champion_overrides": {}, "inventory": []},
+        }
+
+    with open(file_path, "r", encoding="utf-8") as prefs_file:
+        prefs_data = json.load(prefs_file)
+    if not isinstance(prefs_data, dict):
+        raise ValueError(f"Format de préférences invalide : {file_path}")
+    if not isinstance(prefs_data.get("automation_enabled", True), bool):
+        raise ValueError(f"État d’automatisation invalide : {file_path}")
+    return prefs_data
 
 @app.route("/set_icon_default", methods=["POST"])
 def set_icon_default():
@@ -1320,7 +1274,19 @@ def toggle_tft_favorite():
 
 def run_hud():
     print("→ HUD démarré → http://127.0.0.1:5000")
+    browser_timer = Timer(1.0, _open_app_page, args=("http://127.0.0.1:5000",))
+    browser_timer.daemon = True
+    browser_timer.start()
     app.run(port=5000, debug=False, use_reloader=False)
+
+def _open_app_page(url):
+    try:
+        opened = webbrowser.open(url, new=2)
+    except (OSError, webbrowser.Error) as error:
+        print(f"Impossible d'ouvrir le navigateur par défaut : {error}")
+        return
+    if not opened:
+        print(f"Impossible d'ouvrir le navigateur par défaut. Ouvre {url} manuellement.")
 
 if __name__ == "__main__":
     run_hud()

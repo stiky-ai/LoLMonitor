@@ -1,9 +1,12 @@
-name: Windows release
+name: Windows releases
 
 on:
   push:
     tags:
       - "v*"
+      - "LoLMastery-v*"
+      - "LoLRandomSkin-v*"
+      - "TFTRandomSkin-v*"
 
 permissions:
   contents: write
@@ -25,21 +28,73 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt "PyInstaller>=6.10,<7"
 
-      - name: Build standalone executable
-        run: |
-          New-Item -ItemType Directory -Force -Path dist, build\pyinstaller | Out-Null
-          python -m PyInstaller --noconfirm --clean --onefile --console --name LoLMonitor --distpath dist --workpath build\pyinstaller --specpath build\pyinstaller main.py
+      - name: Build product archive
+        id: package
         shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $tag = $env:RELEASE_TAG
+          if ($tag -match '^v(?<version>.+)$') {
+            $product = "LoLMonitor"
+            $entryPoint = "main.py"
+          } elseif ($tag -match '^LoLMastery-v(?<version>.+)$') {
+            $product = "LoLMastery"
+            $entryPoint = "lol_mastery.py"
+          } elseif ($tag -match '^LoLRandomSkin-v(?<version>.+)$') {
+            $product = "LoLRandomSkin"
+            $entryPoint = "lol_random_skin.py"
+          } elseif ($tag -match '^TFTRandomSkin-v(?<version>.+)$') {
+            $product = "TFTRandomSkin"
+            $entryPoint = "tft_random_skin.py"
+          } else {
+            throw "Unsupported release tag: $tag"
+          }
 
-      - name: Assemble portable archive
-        run: |
-          Copy-Item README.md dist\README.md
-          Copy-Item LICENSE dist\LICENSE
-          Compress-Archive -Path dist\LoLMonitor.exe, dist\README.md, dist\LICENSE -DestinationPath dist\LoLMonitor-windows-x64.zip -Force
-        shell: pwsh
+          $outputDir = "dist\$product"
+          $buildDir = "build\pyinstaller\$product"
+          New-Item -ItemType Directory -Force -Path $outputDir, $buildDir | Out-Null
+          python -m PyInstaller --noconfirm --clean --onefile --console --name $product --distpath $outputDir --workpath $buildDir --specpath $buildDir $entryPoint
+          if ($LASTEXITCODE -ne 0) {
+            throw "PyInstaller failed for $product."
+          }
+
+          if ($product -eq "LoLMonitor") {
+            Copy-Item README.md "$outputDir\README.md"
+          } else {
+            $readmeLines = @(
+              "# $product",
+              "",
+              "Windows standalone release. Extract the entire ZIP before launching the executable.",
+              "",
+              "## Démarrage",
+              "",
+              "1. Lancez League of Legends et connectez-vous.",
+              "2. Lancez ``$product.exe`` et laissez la fenêtre de console ouverte.",
+              "3. Fermez la fenêtre pour arrêter l'application."
+            )
+            if ($product -eq "LoLMastery") {
+              $readmeLines += @("", "Ouvrez http://127.0.0.1:5001 dans votre navigateur. Le client Riot doit être ouvert et connecté pour charger les maîtrises.")
+            } elseif ($product -eq "LoLRandomSkin") {
+              $readmeLines += @("", "La sélection automatique LoL s'exécute pendant la sélection des champions. Les préférences sont conservées dans ``skin_prefs.json`` dans le répertoire de travail de l'application.")
+            } elseif ($product -eq "TFTRandomSkin") {
+              $readmeLines += @("", "La sélection automatique TFT s'exécute dans les salons TFT. Les préférences sont conservées dans ``tft_prefs.json`` dans le répertoire de travail de l'application.")
+            }
+            $readmeLines += @("", "LoLMonitor est un projet communautaire non officiel, sans affiliation ni approbation de Riot Games.")
+            $readmeLines | Set-Content -Path "$outputDir\README.md" -Encoding utf8
+          }
+          Copy-Item LICENSE "$outputDir\LICENSE"
+          $archiveName = "$product-windows-x64.zip"
+          Compress-Archive -Path "$outputDir\$product.exe", "$outputDir\README.md", "$outputDir\LICENSE" -DestinationPath "dist\$archiveName" -Force
+          $makeLatest = $product -eq "LoLMonitor"
+          "asset_name=$archiveName" >> $env:GITHUB_OUTPUT
+          "release_name=$product $($Matches.version)" >> $env:GITHUB_OUTPUT
+          "make_latest=$($makeLatest.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/LoLMonitor-windows-x64.zip
+          name: ${{ steps.package.outputs.release_name }}
+          files: dist/${{ steps.package.outputs.asset_name }}
           generate_release_notes: true
+          make_latest: ${{ steps.package.outputs.make_latest }}

@@ -43,10 +43,12 @@ def load_prefs():
     if os.path.exists(PREFS_FILE):
         try:
             with open(PREFS_FILE, encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+                data.setdefault("automation_enabled", True)
+                return data
         except Exception as e:
             log(f"Erreur lecture prefs : {e}")
-    return {"version": 2, "favorites": {}, "library": {}, "summoner_icon": {"default": None, "champion_overrides": {}, "inventory": []}}
+    return {"version": 2, "automation_enabled": True, "favorites": {}, "library": {}, "summoner_icon": {"default": None, "champion_overrides": {}, "inventory": []}}
 
 
 def ensure_summoner_icon_prefs(data):
@@ -59,6 +61,14 @@ def ensure_summoner_icon_prefs(data):
 
 def save_prefs(data):
     try:
+        if os.path.exists(PREFS_FILE):
+            with open(PREFS_FILE, encoding="utf-8") as f:
+                latest_data = json.load(f)
+            data["automation_enabled"] = latest_data.get(
+                "automation_enabled", data.get("automation_enabled", True)
+            )
+        else:
+            data.setdefault("automation_enabled", True)
         with open(PREFS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4, ensure_ascii=False)
         log(f"skin_prefs.json sauvegardé ({len(data.get('library', {}))} champions)")
@@ -67,6 +77,9 @@ def save_prefs(data):
 
 prefs = ensure_summoner_icon_prefs(load_prefs())
 save_prefs(prefs)
+
+def automation_is_enabled():
+    return AUTO_RANDOM_ENABLED and load_prefs().get("automation_enabled", True) is True
 
 # ====================== SUMMONER ICON AUTO-SELECTION ======================
 def get_summoner_icon_for_champion(champ_id):
@@ -467,7 +480,8 @@ def random_skin_worker():
     summoner_id = None
 
     while True:
-        if not AUTO_RANDOM_ENABLED:
+        if not automation_is_enabled():
+            last_champ_id = None
             time.sleep(5)
             continue
 
@@ -579,23 +593,27 @@ def random_skin_worker():
 
                 # Application
                 if skin_id:
-                    payload = {"selectedSkinId": skin_id}
-                    patch_resp = requests.patch(
-                        f"{base_url}/lol-champ-select/v1/session/my-selection",
-                        json=payload, headers=headers, verify=False, timeout=5
-                    )
-                    if patch_resp.status_code in (200, 204):
-                        log(f"  → SKIN APPLIQUÉ AVEC SUCCÈS : {chosen_name} (ID {skin_id})")
+                    if not automation_is_enabled():
+                        last_champ_id = None
+                        log("Automatisme LoL désactivé avant l'application du skin")
                     else:
-                        log(f"  → ÉCHEC APPLICATION (HTTP {patch_resp.status_code})")
+                        payload = {"selectedSkinId": skin_id}
+                        patch_resp = requests.patch(
+                            f"{base_url}/lol-champ-select/v1/session/my-selection",
+                            json=payload, headers=headers, verify=False, timeout=5
+                        )
+                        if patch_resp.status_code in (200, 204):
+                            log(f"  → SKIN APPLIQUÉ AVEC SUCCÈS : {chosen_name} (ID {skin_id})")
+                        else:
+                            log(f"  → ÉCHEC APPLICATION (HTTP {patch_resp.status_code})")
                 else:
                     log("  → Aucun skin sélectionnable")
 
-                if AUTO_SPELL_SELECTION_ENABLED:
+                if automation_is_enabled() and AUTO_SPELL_SELECTION_ENABLED:
                     if not apply_summoner_spells(base_url, headers, SNOWBALL_SPELL_ID, FLASH_SPELL_ID):
                         log("  → Échec de la sélection auto des sorts D/F")
 
-                if AUTO_SUMMONER_ICON_ENABLED:
+                if automation_is_enabled() and AUTO_SUMMONER_ICON_ENABLED:
                     icon_id = get_summoner_icon_for_champion(champ_id)
                     if icon_id is not None:
                         apply_summoner_icon(base_url, headers, icon_id)
