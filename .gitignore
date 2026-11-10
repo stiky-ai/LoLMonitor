@@ -2,6 +2,7 @@
 
 # Dossiers de build
 build/
+dist/
 
 # Caches Python
 __pycache__/

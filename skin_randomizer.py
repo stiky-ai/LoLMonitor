@@ -27,11 +27,13 @@ LOCKFILE_CANDIDATES = [
 
 AUTO_RANDOM_ENABLED = True
 AUTO_SPELL_SELECTION_ENABLED = True
+AUTO_SUMMONER_ICON_ENABLED = False  # Désactivé pour l'instant, conserve le code pour une éventuelle réactivation
 SNOWBALL_SPELL_ID = 32  # ID probable de Boule de neige dans l’API LCU
 FLASH_SPELL_ID = 4      # Flash
 # ────────────────────────────────────────────────
 
 last_champ_id = None
+last_applied_icon_id = None
 prefs = {}
 
 def log(msg):
@@ -44,7 +46,16 @@ def load_prefs():
                 return json.load(f)
         except Exception as e:
             log(f"Erreur lecture prefs : {e}")
-    return {"version": 2, "favorites": {}, "library": {}}
+    return {"version": 2, "favorites": {}, "library": {}, "summoner_icon": {"default": None, "champion_overrides": {}, "inventory": []}}
+
+
+def ensure_summoner_icon_prefs(data):
+    icon_prefs = data.setdefault("summoner_icon", {})
+    icon_prefs.setdefault("default", None)
+    icon_prefs.setdefault("champion_overrides", {})
+    icon_prefs.setdefault("inventory", [])
+    return data
+
 
 def save_prefs(data):
     try:
@@ -54,7 +65,278 @@ def save_prefs(data):
     except Exception as e:
         log(f"Erreur sauvegarde prefs : {e}")
 
-prefs = load_prefs()
+prefs = ensure_summoner_icon_prefs(load_prefs())
+save_prefs(prefs)
+
+# ====================== SUMMONER ICON AUTO-SELECTION ======================
+def get_summoner_icon_for_champion(champ_id):
+    icon_prefs = prefs.get("summoner_icon", {})
+    overrides = icon_prefs.get("champion_overrides", {})
+    icon_id = overrides.get(str(champ_id))
+    if icon_id is not None:
+        return icon_id
+    return icon_prefs.get("default")
+
+
+def apply_summoner_icon(base_url, headers, icon_id):
+    try:
+        icon_url = f"{base_url}/lol-summoner/v1/current-summoner/icon"
+        payload = {"profileIconId": icon_id}
+
+        put_resp = requests.put(
+            icon_url,
+            json=payload, headers=headers, verify=False, timeout=5
+        )
+        if put_resp.status_code in (200, 201, 204):
+            log(f"  → Icône invocateur appliquée : {icon_id}")
+            return True
+
+        log(f"  → Échec application icône (PUT HTTP {put_resp.status_code})")
+
+        # Fallback : essayer le patch sur current-summoner
+        me_resp = requests.get(
+            f"{base_url}/lol-summoner/v1/current-summoner",
+            headers=headers, verify=False, timeout=5
+        )
+        if me_resp.status_code != 200:
+            log(f"  → Impossible de lire current-summoner (HTTP {me_resp.status_code})")
+            return False
+
+        current_data = me_resp.json()
+        payload = current_data.copy()
+        payload["profileIconId"] = icon_id
+        if "iconId" in payload:
+            payload["iconId"] = icon_id
+
+        patch_resp = requests.patch(
+            f"{base_url}/lol-summoner/v1/current-summoner",
+            json=payload, headers=headers, verify=False, timeout=5
+        )
+
+        if patch_resp.status_code in (200, 201, 204):
+            log(f"  → Icône invocateur appliquée via current-summoner : {icon_id}")
+            return True
+
+        log(f"  → Échec application icône (PATCH HTTP {patch_resp.status_code})")
+        return False
+    except Exception as e:
+        log(f"  → Erreur application icône : {e}")
+        return False
+
+
+def get_champion_id_from_my_selection(base_url, headers):
+    try:
+        my_sel_resp = requests.get(
+            f"{base_url}/lol-champ-select/v1/session/my-selection",
+            headers=headers, verify=False, timeout=4
+        )
+        if my_sel_resp.status_code != 200:
+            return None
+
+        selection = my_sel_resp.json()
+        for key in ("championId", "selectedChampionId", "pickedChampionId", "championPickIntent"):
+            value = selection.get(key)
+            if isinstance(value, int) and value > 0:
+                return value
+    except Exception as e:
+        log(f"  → Impossible de lire my-selection early champion: {e}")
+    return None
+
+
+def get_ddragon_version():
+    try:
+        versions = requests.get(
+            "https://ddragon.leagueoflegends.com/api/versions.json",
+            verify=False, timeout=5
+        ).json()
+        return versions[0] if isinstance(versions, list) and versions else "latest"
+    except:
+        return "latest"
+
+
+def load_ddragon_profile_icons(version):
+    try:
+        resp = requests.get(
+            f"https://ddragon.leagueoflegends.com/cdn/{version}/data/fr_FR/profileicon.json",
+            verify=False, timeout=10
+        )
+        if resp.status_code != 200:
+            log(f"Impossible de récupérer DataDragon profileicon.json (HTTP {resp.status_code})")
+            return []
+
+        data = resp.json().get("data", {})
+        inventory = []
+        for key, icon in data.items():
+            try:
+                icon_id = int(icon.get("id", key))
+            except Exception:
+                continue
+            image_file = icon.get("image", {}).get("full")
+            image_url = f"https://ddragon.leagueoflegends.com/cdn/{version}/img/profileicon/{image_file}" if image_file else f"https://ddragon.leagueoflegends.com/cdn/{version}/img/profileicon/{icon_id}.png"
+            inventory.append({
+                "id": icon_id,
+                "name": icon.get("title") or f"Icône {icon_id}",
+                "owned": True,
+                "image": image_url
+            })
+        return inventory
+    except Exception as e:
+        log(f"Erreur chargement DataDragon profile icon list : {e}")
+        return []
+
+
+def update_summoner_icon_inventory(base_url, headers, summoner_id):
+    global prefs
+
+    def fetch_inventory():
+        # ────────────────────────────────────────────────
+        # 1. TRY LOADOUTS
+        # ────────────────────────────────────────────────
+        try:
+            url = f"{base_url}/lol-loadouts/v4/loadouts/summoner-icon"
+            r = requests.get(url, headers=headers, verify=False, timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+                return {
+                    "current": data.get("selectedId"),
+                    "ids": data.get("inventory", [])
+                }
+            else:
+                log(f"Loadouts FAIL ({r.status_code})")
+        except:
+            pass
+
+        # ────────────────────────────────────────────────
+        # 2. TRY INVENTORY
+        # ────────────────────────────────────────────────
+        try:
+            url = f"{base_url}/lol-inventory/v1/inventories/{summoner_id}/summoner-icons"
+            r = requests.get(url, headers=headers, verify=False, timeout=5)
+            if r.status_code == 200:
+                ids = [
+                    item.get("itemId")
+                    for item in r.json()
+                    if item.get("ownershipType") == "OWNED"
+                ]
+                return {
+                    "current": None,
+                    "ids": ids
+                }
+            else:
+                log(f"Inventory FAIL ({r.status_code})")
+        except:
+            pass
+
+        # ────────────────────────────────────────────────
+        # 3. TRY COLLECTIONS (🔥 le plus fiable)
+        # ────────────────────────────────────────────────
+        try:
+            url = f"{base_url}/lol-collections/v1/inventories/{summoner_id}/profile-icons"
+            r = requests.get(url, headers=headers, verify=False, timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+
+                ids = [
+                    item.get("id")
+                    for item in data
+                    if item.get("owned") is True
+                ]
+
+                current = next(
+                    (item.get("id") for item in data if item.get("selected")),
+                    None
+                )
+
+                return {
+                    "current": current,
+                    "ids": ids
+                }
+            else:
+                log(f"Collections FAIL ({r.status_code})")
+        except:
+            pass
+
+        return None
+
+    try:
+        result = fetch_inventory()
+
+        if not result:
+            log("❌ Aucun endpoint valide pour les icônes")
+            result = None
+
+        owned_ids = result["ids"] if result else None
+        current_icon_id = result["current"] if result else None
+
+        # fallback current si absent
+        if not current_icon_id:
+            try:
+                me_resp = requests.get(
+                    f"{base_url}/lol-summoner/v1/current-summoner",
+                    headers=headers, verify=False, timeout=5
+                )
+                if me_resp.status_code == 200:
+                    current_icon_id = me_resp.json().get("profileIconId")
+            except:
+                pass
+
+        log(f"🎯 Icône actuelle : {current_icon_id}")
+
+        # ────────────────────────────────────────────────
+        # DataDragon enrich — récupérer toutes les icônes
+        # ────────────────────────────────────────────────
+        version = get_ddragon_version()
+        ddragon_icons = load_ddragon_profile_icons(version)
+
+        existing_inventory = {
+            icon["id"]: icon
+            for icon in prefs.get("summoner_icon", {}).get("inventory", [])
+            if isinstance(icon.get("id"), int)
+        }
+
+        inventory = []
+        if ddragon_icons:
+            for icon in ddragon_icons:
+                icon_id = icon.get("id")
+                if icon_id is None:
+                    continue
+                preserved = existing_inventory.get(icon_id, {})
+                inventory.append({
+                    **icon,
+                    "owned": preserved.get("owned", True)
+                })
+        else:
+            inventory = list(existing_inventory.values())
+
+        if current_icon_id and isinstance(current_icon_id, int) and current_icon_id not in {icon["id"] for icon in inventory}:
+            inventory.append({
+                "id": current_icon_id,
+                "name": f"Icône {current_icon_id}",
+                "owned": True,
+                "image": f"https://ddragon.leagueoflegends.com/cdn/{version}/img/profileicon/{current_icon_id}.png"
+            })
+
+        # ────────────────────────────────────────────────
+        # Save prefs
+        # ────────────────────────────────────────────────
+        icon_prefs = prefs.setdefault("summoner_icon", {})
+        icon_prefs.setdefault("default", None)
+        icon_prefs.setdefault("champion_overrides", {})
+
+        icon_prefs["inventory"] = inventory
+        icon_prefs["current"] = current_icon_id
+
+        if icon_prefs.get("default") is None and current_icon_id:
+            icon_prefs["default"] = current_icon_id
+
+        save_prefs(prefs)
+
+        log(f"✅ Icônes récupérées ({len(inventory)})")
+        return True
+
+    except Exception as e:
+        log(f"Erreur icônes : {e}")
+        return False
 
 # ====================== SPELLS AUTO-SELECTION ======================
 def apply_summoner_spells(base_url, headers, spell1_id, spell2_id):
@@ -178,10 +460,11 @@ def update_skin_library(base_url, headers, summoner_id):
 
 # ====================== WORKER PRINCIPAL ======================
 def random_skin_worker():
-    global last_champ_id, prefs
+    global last_champ_id, prefs, last_applied_icon_id
     log("Thread démarré – polling + mise à jour automatique library")
 
     library_updated = False
+    summoner_id = None
 
     while True:
         if not AUTO_RANDOM_ENABLED:
@@ -219,6 +502,7 @@ def random_skin_worker():
                     summoner_id = me_resp.json().get("summonerId")
                     if summoner_id:
                         update_skin_library(base_url, headers, summoner_id)
+                        update_summoner_icon_inventory(base_url, headers, summoner_id)
                         library_updated = True
 
             # Le reste du code pour le random skin (inchangé)
@@ -310,6 +594,12 @@ def random_skin_worker():
                 if AUTO_SPELL_SELECTION_ENABLED:
                     if not apply_summoner_spells(base_url, headers, SNOWBALL_SPELL_ID, FLASH_SPELL_ID):
                         log("  → Échec de la sélection auto des sorts D/F")
+
+                if AUTO_SUMMONER_ICON_ENABLED:
+                    icon_id = get_summoner_icon_for_champion(champ_id)
+                    if icon_id is not None:
+                        apply_summoner_icon(base_url, headers, icon_id)
+
         except Exception as e:
             log(f"Erreur dans le polling : {str(e)}")
 
