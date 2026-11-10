@@ -20,6 +20,8 @@ Lancer le script principal selon la fonctionnalité souhaitée :
 python main.py
 ```
 
+Dans le HUD, ouvrez **Maîtrise** pour afficher les maîtrises du compte actuellement connecté au client LoL. Le client doit être ouvert et connecté. La liste est triée par XP restante; le filtre de niveau et le seuil de proximité (1 000 XP par défaut) sont réglables dans la vue.
+
 ## À ignorer dans le dépôt
 - Fichiers de build
 - Caches Python
