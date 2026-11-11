@@ -125,6 +125,61 @@ def get_gameflow_phase():
     return {"phase": phase}, 200
 
 
+def get_champion_select_pool():
+    response, error = _get_lcu_response("/lol-champ-select/v1/session")
+    if error:
+        return error
+
+    if response.status_code == 404:
+        return {
+            "available": False,
+            "selectedChampionIds": [],
+            "benchChampionIds": [],
+        }, 200
+    if response.status_code != 200:
+        return {
+            "error": (
+                "Le client LoL a refusé la lecture de la sélection "
+                f"(HTTP {response.status_code})."
+            )
+        }, 502
+
+    try:
+        session = response.json()
+    except ValueError:
+        return {"error": "Le client LoL a renvoyé une sélection invalide."}, 502
+
+    if not isinstance(session, dict) or not isinstance(session.get("myTeam"), list):
+        return {"error": "Le format de la sélection renvoyée par le client est invalide."}, 502
+
+    bench_champions = session.get("benchChampions", [])
+    if not isinstance(bench_champions, list):
+        return {"error": "Le format du banc de champions renvoyé par le client est invalide."}, 502
+    if any(not isinstance(player, dict) for player in session["myTeam"]):
+        return {"error": "Le format de l’équipe alliée renvoyé par le client est invalide."}, 502
+    if any(not isinstance(champion, dict) for champion in bench_champions):
+        return {"error": "Le format du banc de champions renvoyé par le client est invalide."}, 502
+
+    selected_champion_ids = {
+        champion_id
+        for player in session["myTeam"]
+        if (champion_id := _read_non_negative_int(player, "championId")) is not None
+        and champion_id > 0
+    }
+    bench_champion_ids = {
+        champion_id
+        for champion in bench_champions
+        if (champion_id := _read_non_negative_int(champion, "championId")) is not None
+        and champion_id > 0
+    } - selected_champion_ids
+
+    return {
+        "available": True,
+        "selectedChampionIds": sorted(selected_champion_ids),
+        "benchChampionIds": sorted(bench_champion_ids),
+    }, 200
+
+
 def _read_non_negative_int(data, *field_names):
     value = next((data.get(field) for field in field_names if field in data), None)
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:

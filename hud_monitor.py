@@ -16,6 +16,7 @@ from lol_mastery import (
     CHAMP_NAMES as MASTERY_CHAMP_NAMES,
     DD_VERSION as MASTERY_DD_VERSION,
     MASTERY_HTML,
+    get_champion_select_pool,
     get_gameflow_phase,
     get_mastery_data,
 )
@@ -1050,6 +1051,13 @@ def mastery_data():
 @app.route("/gameflow-phase")
 def mastery_gameflow_phase():
     payload, status = get_gameflow_phase()
+    response = jsonify(payload)
+    response.headers["Cache-Control"] = "no-store"
+    return response, status
+
+@app.route("/champion-select-pool")
+def mastery_champion_select_pool():
+    payload, status = get_champion_select_pool()
     response = jsonify(payload)
     response.headers["Cache-Control"] = "no-store"
     return response, status

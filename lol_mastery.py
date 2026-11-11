@@ -4,6 +4,7 @@ import webbrowser
 from flask import Flask, jsonify, render_template_string
 
 from mastery_service import (
+    get_champion_select_pool,
     get_gameflow_phase,
     get_mastery_data,
     get_post_game_mastery_update,
@@ -65,11 +66,18 @@ MASTERY_HTML = """
         #mastery-root #status { min-height:24px; margin:0 0 8px; color:#a5f3fc; }
         #mastery-root #status.error { color:#fca5a5; }
         #mastery-root #gameflow-status { min-height:20px; margin:0 0 10px; color:#94a3b8; font-size:.86rem; }
-        #mastery-root .mastery-legend { display:flex; align-items:center; gap:8px; margin:0 0 10px; color:#cbd5e1; font-size:.8rem; }
-        #mastery-root .mastery-legend-mark { width:11px; height:11px; border:2px solid #facc15; border-radius:3px; box-shadow:0 0 8px rgba(250,204,21,.2); }
+        #mastery-root #champion-select-status { min-height:20px; margin:0 0 10px; color:#94a3b8; font-size:.86rem; }
+        #mastery-root #champion-select-status.error { color:#fca5a5; }
+        #mastery-root .mastery-legend { display:flex; align-items:center; flex-wrap:wrap; gap:8px; margin:0 0 10px; color:#cbd5e1; font-size:.8rem; }
+        #mastery-root .mastery-legend-mark { width:11px; height:11px; flex:none; border:2px solid currentColor; border-radius:3px; }
+        #mastery-root .mastery-legend-mark.is-close { color:#facc15; box-shadow:0 0 8px rgba(250,204,21,.2); }
+        #mastery-root .mastery-legend-mark.is-selected { color:#22d3ee; }
+        #mastery-root .mastery-legend-mark.is-bench { color:#c084fc; }
         #mastery-root #list { display:grid; grid-template-columns:repeat(auto-fill,minmax(min(100%,var(--card-size,250px)),1fr)); gap:12px; }
         #mastery-root .card { min-width:0; padding:12px; border:1px solid #334155; border-radius:12px; background:linear-gradient(145deg,rgba(23,39,61,.96),rgba(12,24,40,.96)); box-shadow:0 10px 28px rgba(0,0,0,.18); }
         #mastery-root .card.close { border:2px solid #facc15; box-shadow:0 0 0 2px rgba(250,204,21,.18); }
+        #mastery-root .card.ally-selected { outline:2px solid #22d3ee; outline-offset:1px; }
+        #mastery-root .card.ally-bench { outline:2px solid #c084fc; outline-offset:1px; }
         #mastery-root .card.max-level { border-color:#64748b; }
         #mastery-root .card-head { display:flex; align-items:center; gap:8px; }
         #mastery-root .card-title { display:flex; align-items:center; gap:8px; flex:1; min-width:0; }
@@ -79,6 +87,9 @@ MASTERY_HTML = """
         #mastery-root h2 { width:100%; overflow:hidden; margin:0; color:#93c5fd; font-size:.84rem; text-align:center; text-overflow:ellipsis; white-space:nowrap; }
         #mastery-root .level { display:grid; place-items:center; width:52px; height:52px; flex:none; border:1px solid currentColor; border-radius:50%; font-size:1.4rem; font-weight:800; }
         #mastery-root .estimate-badge { padding:2px 6px; border:1px solid #a16207; border-radius:999px; background:#422006; color:#fde68a; font-size:.68rem; font-weight:750; }
+        #mastery-root .availability-badge { padding:2px 6px; border:1px solid currentColor; border-radius:999px; font-size:.68rem; font-weight:750; }
+        #mastery-root .availability-badge.is-selected { background:rgba(8,145,178,.18); color:#67e8f9; }
+        #mastery-root .availability-badge.is-bench { background:rgba(126,34,206,.18); color:#d8b4fe; }
         #mastery-root .mastery-level-basic { background:#334155; color:#cbd5e1; }
         #mastery-root .mastery-level-black { background:#020617; color:#f8fafc; }
         #mastery-root .mastery-level-green { background:#14532d; color:#4ade80; }
@@ -145,15 +156,23 @@ MASTERY_HTML = """
         </div>
         <p id="status" role="status" aria-live="polite">Prêt à charger les maîtrises.</p>
         <p id="gameflow-status" role="status" aria-live="polite">Actualisation automatique à la fin d’une partie LoL.</p>
-        <div class="mastery-legend"><span class="mastery-legend-mark" aria-hidden="true"></span><span>Bordure dorée : proche du niveau suivant</span></div>
+        <p id="champion-select-status" role="status" aria-live="polite">Vérification de la sélection de champions…</p>
+        <div class="mastery-legend" aria-label="Légende des indicateurs">
+            <span class="mastery-legend-mark is-close" aria-hidden="true"></span><span>Bordure dorée : proche du niveau suivant</span>
+            <span class="mastery-legend-mark is-selected" aria-hidden="true"></span><span>Contour cyan : sélectionné par un allié</span>
+            <span class="mastery-legend-mark is-bench" aria-hidden="true"></span><span>Contour violet : disponible sur le banc ARAM</span>
+        </div>
         <section id="list" aria-label="Maîtrises des champions"></section>
     </main>
     <script>
         let champions = [];
         let visibleChampions = [];
+        let selectedChampionIds = new Set();
+        let benchChampionIds = new Set();
         const expandedChampions = new Set();
         let matchInProgress = false;
         let gameflowPollInProgress = false;
+        let championSelectPollInProgress = false;
         let masteryRefreshPending = false;
         let matchMasterySnapshot = null;
         let postGameSyncTimer = null;
@@ -163,8 +182,10 @@ MASTERY_HTML = """
         const postGameSyncInterval = 2000;
         const postGameSyncMaxAttempts = 31;
         const gameflowPollInterval = 2000;
+        const championSelectPollInterval = 2000;
         const statusNode = document.getElementById("status");
         const gameflowStatusNode = document.getElementById("gameflow-status");
+        const championSelectStatusNode = document.getElementById("champion-select-status");
         const list = document.getElementById("list");
         const cardSizeControl = document.getElementById("card-size");
         const cardSizeValue = document.getElementById("card-size-value");
@@ -222,7 +243,11 @@ MASTERY_HTML = """
                 card.className = "card";
                 const isClose = champion.hasNextLevel && champion.xpRemaining <= threshold;
                 const isExpanded = expandedChampions.has(String(champion.championId));
+                const isSelectedByAlly = selectedChampionIds.has(champion.championId);
+                const isOnBench = benchChampionIds.has(champion.championId);
                 if (isClose) card.classList.add("close");
+                if (isSelectedByAlly) card.classList.add("ally-selected");
+                else if (isOnBench) card.classList.add("ally-bench");
                 if (!champion.hasNextLevel) card.classList.add("max-level");
                 const heading = document.createElement("div");
                 heading.className = "card-head";
@@ -256,6 +281,12 @@ MASTERY_HTML = """
                     info.append(title, level, estimateBadge);
                 } else {
                     info.append(title, level);
+                }
+                if (isSelectedByAlly || isOnBench) {
+                    const availability = document.createElement("span");
+                    availability.className = `availability-badge ${isSelectedByAlly ? "is-selected" : "is-bench"}`;
+                    availability.textContent = isSelectedByAlly ? "Équipe" : "Banc ARAM";
+                    info.append(availability);
                 }
 
                 const detailsId = `mastery-details-${champion.championId}`;
@@ -505,6 +536,43 @@ MASTERY_HTML = """
             }
         }
 
+        function sameChampionIds(left, right) {
+            return left.size === right.size && [...left].every(championId => right.has(championId));
+        }
+
+        async function checkChampionSelectPool() {
+            if (championSelectPollInProgress) return;
+            championSelectPollInProgress = true;
+            try {
+                const response = await fetch("/champion-select-pool", {cache: "no-store"});
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+                if (typeof data.available !== "boolean"
+                    || !Array.isArray(data.selectedChampionIds)
+                    || !Array.isArray(data.benchChampionIds)) {
+                    throw new Error("Format de la sélection de champions invalide.");
+                }
+
+                const nextSelectedIds = new Set(data.available ? data.selectedChampionIds : []);
+                const nextBenchIds = new Set(data.available ? data.benchChampionIds : []);
+                const changed = !sameChampionIds(selectedChampionIds, nextSelectedIds)
+                    || !sameChampionIds(benchChampionIds, nextBenchIds);
+                selectedChampionIds = nextSelectedIds;
+                benchChampionIds = nextBenchIds;
+
+                championSelectStatusNode.classList.remove("error");
+                championSelectStatusNode.textContent = data.available
+                    ? `Sélection en cours · ${selectedChampionIds.size} champion(s) allié(s) sélectionné(s), ${benchChampionIds.size} disponible(s) sur le banc.`
+                    : "Aucune sélection de champion en cours.";
+                if (changed && champions.length) render();
+            } catch (error) {
+                championSelectStatusNode.classList.add("error");
+                championSelectStatusNode.textContent = `Lecture de la sélection indisponible : ${error.message}`;
+            } finally {
+                championSelectPollInProgress = false;
+            }
+        }
+
         document.getElementById("search").addEventListener("input", render);
         document.getElementById("sort-order").addEventListener("change", render);
         document.getElementById("level-filter").addEventListener("change", render);
@@ -519,7 +587,9 @@ MASTERY_HTML = """
         });
         loadMasteries();
         checkGameflow();
+        checkChampionSelectPool();
         window.setInterval(checkGameflow, gameflowPollInterval);
+        window.setInterval(checkChampionSelectPool, championSelectPollInterval);
     </script>
 </body>
 </html>
@@ -550,6 +620,14 @@ def post_game_mastery_update():
 @app.route("/gameflow-phase")
 def gameflow_phase():
     payload, status = get_gameflow_phase()
+    response = jsonify(payload)
+    response.headers["Cache-Control"] = "no-store"
+    return response, status
+
+
+@app.route("/champion-select-pool")
+def champion_select_pool():
+    payload, status = get_champion_select_pool()
     response = jsonify(payload)
     response.headers["Cache-Control"] = "no-store"
     return response, status

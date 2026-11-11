@@ -16,6 +16,77 @@ class FakeResponse:
         return self._payload
 
 
+class ChampionSelectPoolTests(unittest.TestCase):
+    def test_returns_allied_picks_and_bench_without_duplicates_or_invalid_ids(self):
+        session = {
+            "myTeam": [
+                {"championId": 67},
+                {"championId": 11},
+                {"championId": 0},
+                {"championId": True},
+            ],
+            "theirTeam": [{"championId": 22}],
+            "benchChampions": [
+                {"championId": 45},
+                {"championId": 67},
+                {"championId": -1},
+                {"championId": "22"},
+            ],
+        }
+
+        with patch.object(
+            mastery_service,
+            "_get_lcu_response",
+            return_value=(FakeResponse(200, session), None),
+        ) as get_lcu_response:
+            pool, status = mastery_service.get_champion_select_pool()
+
+        get_lcu_response.assert_called_once_with("/lol-champ-select/v1/session")
+        self.assertEqual(status, 200)
+        self.assertEqual(pool, {
+            "available": True,
+            "selectedChampionIds": [11, 67],
+            "benchChampionIds": [45],
+        })
+
+    def test_no_active_champion_select_session_returns_empty_pool(self):
+        with patch.object(
+            mastery_service,
+            "_get_lcu_response",
+            return_value=(FakeResponse(404, {}), None),
+        ):
+            pool, status = mastery_service.get_champion_select_pool()
+
+        self.assertEqual(status, 200)
+        self.assertEqual(pool, {
+            "available": False,
+            "selectedChampionIds": [],
+            "benchChampionIds": [],
+        })
+
+    def test_invalid_champion_select_session_returns_an_error(self):
+        with patch.object(
+            mastery_service,
+            "_get_lcu_response",
+            return_value=(FakeResponse(200, {"myTeam": {}}), None),
+        ):
+            error, status = mastery_service.get_champion_select_pool()
+
+        self.assertEqual(status, 502)
+        self.assertIn("error", error)
+
+    def test_lcu_connection_error_is_returned(self):
+        lcu_error = ({"error": "Client LoL introuvable."}, 503)
+        with patch.object(
+            mastery_service,
+            "_get_lcu_response",
+            return_value=(None, lcu_error),
+        ):
+            error = mastery_service.get_champion_select_pool()
+
+        self.assertEqual(error, lcu_error)
+
+
 class PostGameMasteryTests(unittest.TestCase):
     def setUp(self):
         mastery_service._PROVISIONAL_MASTERY_UPDATES.clear()

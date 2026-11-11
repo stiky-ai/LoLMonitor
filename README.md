@@ -24,7 +24,7 @@ Des versions autonomes de **LoLMastery**, **LoLRandomSkin** et **TFTRandomSkin**
 ## Fonctionnalités
 
 - **HUD LoL dans le navigateur** : suivi en direct des équipes, estimation de l'or à partir des objets, différence d'or et minuteurs de sorts.
-- **Maîtrises** : consultation des maîtrises du compte connecté, actualisation automatique à la fin d'une partie LoL et bouton d'actualisation manuelle.
+- **Maîtrises** : consultation des maîtrises du compte connecté, actualisation automatique à la fin d'une partie LoL et bouton d'actualisation manuelle. Pendant la sélection, les champions alliés choisis et ceux disponibles sur le banc ARAM sont signalés dans la liste.
 - **Préférences LoL** : bibliothèque de skins et favoris, avec sélection automatique de skins et de sorts d'invocateur pendant la sélection des champions.
 - **Icônes d'invocateur** : préférences d'icône par défaut ou par champion.
 - **Cosmétiques TFT** : favoris et sélection automatique de compagnons, skins de carte, dégâts et zoom; sélection du compagnon prévue par le programme en ARAM.
