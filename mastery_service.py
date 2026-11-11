@@ -1,5 +1,7 @@
 import base64
+import json
 import os
+from statistics import median
 
 import requests
 
@@ -9,6 +11,15 @@ LCU_LOCKFILE_CANDIDATES = [
     os.path.expanduser(r"~\AppData\Local\Riot Games\League of Legends\lockfile"),
 ]
 _PROVISIONAL_MASTERY_UPDATES = {}
+_MASTERY_GAIN_HISTORY_PATH = os.path.join(
+    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+    "LoLMonitor",
+    "mastery_gain_samples.json",
+)
+_MIN_REAL_GAIN_SAMPLES_FOR_ESTIMATE = 3
+_LAST_MASTERY_SNAPSHOT = {}
+_MATCH_MASTERY_SNAPSHOT = {}
+_LAST_GAMEFLOW_PHASE = None
 
 
 def load_champion_catalog():
@@ -87,6 +98,8 @@ def _get_lcu_response(endpoint):
 
 
 def get_gameflow_phase():
+    global _LAST_GAMEFLOW_PHASE, _MATCH_MASTERY_SNAPSHOT
+
     response, error = _get_lcu_response("/lol-gameflow/v1/gameflow-phase")
     if error:
         return error
@@ -102,6 +115,13 @@ def get_gameflow_phase():
     if not isinstance(phase, str):
         return {"error": "Le format de l’état de partie renvoyé par le client est invalide."}, 502
 
+    if phase == "InProgress" and _LAST_GAMEFLOW_PHASE != "InProgress":
+        _MATCH_MASTERY_SNAPSHOT = {
+            champion_id: dict(mastery)
+            for champion_id, mastery in _LAST_MASTERY_SNAPSHOT.items()
+        }
+    _LAST_GAMEFLOW_PHASE = phase
+
     return {"phase": phase}, 200
 
 
@@ -110,6 +130,179 @@ def _read_non_negative_int(data, *field_names):
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         return None
     return value
+
+
+def _load_mastery_gain_samples():
+    try:
+        with open(_MASTERY_GAIN_HISTORY_PATH, "r", encoding="utf-8") as history_file:
+            samples = json.load(history_file)
+    except FileNotFoundError:
+        return [], None
+    except (OSError, ValueError) as error:
+        return [], f"Impossible de lire l’historique local des gains de maîtrise : {error}"
+
+    if not isinstance(samples, list):
+        return [], "L’historique local des gains de maîtrise a un format invalide."
+
+    valid_samples = [
+        sample
+        for sample in samples
+        if isinstance(sample, dict)
+        and _read_non_negative_int(sample, "gameId") is not None
+        and _read_non_negative_int(sample, "championId") is not None
+        and _read_non_negative_int(sample, "pointsGained") is not None
+        and sample["pointsGained"] > 0
+    ]
+    return valid_samples, None
+
+
+def _record_observed_mastery_gain(update):
+    samples, error = _load_mastery_gain_samples()
+    if error:
+        return error
+
+    game_id = update["gameId"]
+    champion_id = update["championId"]
+    if any(
+        sample["gameId"] == game_id and sample["championId"] == champion_id
+        for sample in samples
+    ):
+        return None
+
+    samples.append({
+        "gameId": game_id,
+        "championId": champion_id,
+        "pointsGained": update["championPointsGained"],
+    })
+    try:
+        os.makedirs(os.path.dirname(_MASTERY_GAIN_HISTORY_PATH), exist_ok=True)
+        with open(_MASTERY_GAIN_HISTORY_PATH, "w", encoding="utf-8") as history_file:
+            json.dump(samples[-50:], history_file, ensure_ascii=True, indent=2)
+    except OSError as write_error:
+        return f"Impossible d’enregistrer l’historique local des gains de maîtrise : {write_error}"
+    return None
+
+
+def _read_current_champion_mastery(champion_id):
+    response, error = _get_lcu_response(
+        "/lol-champion-mastery/v1/local-player/champion-mastery"
+    )
+    if error:
+        return None, error[0].get("error")
+    if response.status_code != 200:
+        return None, f"Lecture actuelle des maîtrises refusée (HTTP {response.status_code})."
+
+    try:
+        mastery_data = response.json()
+    except ValueError:
+        return None, "Le client a renvoyé des maîtrises invalides."
+    if not isinstance(mastery_data, list):
+        return None, "Le format des maîtrises renvoyées par le client est invalide."
+
+    for mastery in mastery_data:
+        if (
+            isinstance(mastery, dict)
+            and _read_non_negative_int(mastery, "championId") == champion_id
+            and _read_non_negative_int(mastery, "championLevel") is not None
+            and _read_non_negative_int(mastery, "championPoints") is not None
+        ):
+            return mastery, None
+    return None, None
+
+
+def _estimate_post_game_mastery_update(game_id, champion_id, warning=None):
+    baseline = _MATCH_MASTERY_SNAPSHOT.get(champion_id)
+    if baseline is not None:
+        current_mastery, read_error = _read_current_champion_mastery(champion_id)
+        if (
+            current_mastery is not None
+            and current_mastery["championPoints"] > baseline["championPoints"]
+        ):
+            observed_update = {
+                "gameId": game_id,
+                "championId": champion_id,
+                "championLevel": current_mastery["championLevel"],
+                "championPointsBeforeGame": baseline["championPoints"],
+                "championPointsGained": (
+                    current_mastery["championPoints"] - baseline["championPoints"]
+                ),
+                "championPointsUntilNextLevelAfterGame": _read_non_negative_int(
+                    current_mastery,
+                    "championPointsUntilNextLevel",
+                ),
+                "championLevelUp": (
+                    current_mastery["championLevel"] > baseline["championLevel"]
+                ),
+                "pointsIntoLevel": None,
+                "_fallbackBeforeGamePoints": baseline["championPoints"],
+                "_isEstimated": False,
+            }
+            _PROVISIONAL_MASTERY_UPDATES[champion_id] = observed_update
+            history_warning = _record_observed_mastery_gain(observed_update)
+            public_update = {
+                key: value
+                for key, value in observed_update.items()
+                if not key.startswith("_")
+            }
+            public_update["source"] = "observed-delta"
+            if history_warning:
+                public_update["warning"] = history_warning
+            return {"available": True, **public_update}, 200
+        if warning is None and read_error:
+            warning = read_error
+
+    samples, error = _load_mastery_gain_samples()
+    if error:
+        return {"error": error}, 500
+
+    observed_gains = [sample["pointsGained"] for sample in samples]
+    sample_count = len(observed_gains)
+    if sample_count < _MIN_REAL_GAIN_SAMPLES_FOR_ESTIMATE or baseline is None:
+        result = {
+            "available": False,
+            "estimatePending": True,
+            "observedGainSamples": sample_count,
+            "requiredGainSamples": _MIN_REAL_GAIN_SAMPLES_FOR_ESTIMATE,
+            "pendingReason": (
+                "missing-match-snapshot"
+                if baseline is None
+                else "insufficient-real-gains"
+            ),
+        }
+        if warning:
+            result["warning"] = warning
+        return result, 200
+
+    points_gained = int(round(median(observed_gains[-7:])))
+    update = {
+        "gameId": game_id,
+        "championId": champion_id,
+        "championLevel": baseline["championLevel"],
+        "championPointsBeforeGame": baseline["championPoints"],
+        "championPointsGained": points_gained,
+        "championPointsUntilNextLevelAfterGame": (
+            baseline["championPointsUntilNextLevel"] - points_gained
+            if baseline.get("championPointsUntilNextLevel") is not None
+            and baseline["championPointsUntilNextLevel"] > points_gained
+            else None
+        ),
+        "championLevelUp": False,
+        "pointsIntoLevel": None,
+        "_fallbackBeforeGamePoints": baseline["championPoints"],
+        "_isEstimated": True,
+        "_estimateSampleCount": sample_count,
+    }
+    _PROVISIONAL_MASTERY_UPDATES[champion_id] = update
+    public_update = {
+        key: value
+        for key, value in update.items()
+        if not key.startswith("_")
+    }
+    public_update["isEstimated"] = True
+    public_update["estimateSampleCount"] = sample_count
+    if warning:
+        public_update["warning"] = warning
+    return {"available": True, **public_update}, 200
 
 
 def _normalize_post_game_mastery_update(data, champion_id, game_id):
@@ -130,6 +323,10 @@ def _normalize_post_game_mastery_update(data, champion_id, game_id):
         data,
         "championPointsUntilNextLevelBeforeGame",
     )
+    points_since_last_level_before_game = _read_non_negative_int(
+        data,
+        "championPointsSinceLastLevelBeforeGame",
+    )
     level_up = data.get("championLevelUp", data.get("hasLeveledUp"))
 
     if (
@@ -145,6 +342,11 @@ def _normalize_post_game_mastery_update(data, champion_id, game_id):
     points_into_level = None
     if level_up and points_until_next_level_before_game is not None:
         points_into_level = max(0, points_gained - points_until_next_level_before_game + 1)
+    elif not level_up and points_since_last_level_before_game is not None:
+        points_into_level = points_since_last_level_before_game + points_gained
+
+    if not level_up and points_until_next_level is None and points_until_next_level_before_game is not None:
+        points_until_next_level = max(0, points_until_next_level_before_game - points_gained)
 
     return {
         "gameId": game_id,
@@ -155,6 +357,7 @@ def _normalize_post_game_mastery_update(data, champion_id, game_id):
         "championPointsUntilNextLevelAfterGame": points_until_next_level,
         "championLevelUp": level_up,
         "pointsIntoLevel": points_into_level,
+        "_fallbackBeforeGamePoints": None,
     }
 
 
@@ -184,16 +387,28 @@ def get_post_game_mastery_update():
         "/lol-end-of-game/v1/champion-mastery-updates"
     )
     if error:
-        return error
+        return _estimate_post_game_mastery_update(
+            game_id,
+            champion_id,
+            "Le client n’a pas fourni le gain réel de maîtrise.",
+        )
     if mastery_response.status_code in (204, 404):
-        return {"available": False}, 200
+        return _estimate_post_game_mastery_update(game_id, champion_id)
     if mastery_response.status_code != 200:
-        return {"error": f"Le client LoL a refusé la lecture des gains de maîtrise (HTTP {mastery_response.status_code})."}, 502
+        return _estimate_post_game_mastery_update(
+            game_id,
+            champion_id,
+            f"Le client a refusé le gain réel de maîtrise (HTTP {mastery_response.status_code}).",
+        )
 
     try:
         mastery_update = mastery_response.json()
     except ValueError:
-        return {"error": "Le client LoL a renvoyé des gains de maîtrise invalides."}, 502
+        return _estimate_post_game_mastery_update(
+            game_id,
+            champion_id,
+            "Le client a renvoyé un gain de maîtrise invalide.",
+        )
 
     normalized_update = _normalize_post_game_mastery_update(
         mastery_update,
@@ -201,13 +416,34 @@ def get_post_game_mastery_update():
         game_id,
     )
     if normalized_update is None:
-        return {"available": False}, 200
+        return _estimate_post_game_mastery_update(
+            game_id,
+            champion_id,
+            "Le client n’a pas fourni de gain réel exploitable.",
+        )
 
+    normalized_update["_isEstimated"] = False
+    previous_update = _PROVISIONAL_MASTERY_UPDATES.get(champion_id)
+    if previous_update and previous_update["gameId"] == game_id:
+        if normalized_update["championPointsBeforeGame"] is None:
+            normalized_update["_fallbackBeforeGamePoints"] = previous_update[
+                "_fallbackBeforeGamePoints"
+            ]
     _PROVISIONAL_MASTERY_UPDATES[champion_id] = normalized_update
-    return {"available": True, **normalized_update}, 200
+    history_warning = _record_observed_mastery_gain(normalized_update)
+    public_update = {
+        key: value
+        for key, value in normalized_update.items()
+        if not key.startswith("_")
+    }
+    if history_warning:
+        public_update["warning"] = history_warning
+    return {"available": True, **public_update}, 200
 
 
 def get_mastery_data(champ_names, champ_images, version):
+    global _LAST_MASTERY_SNAPSHOT
+
     response, error = _get_lcu_response(
         "/lol-champion-mastery/v1/local-player/champion-mastery"
     )
@@ -224,6 +460,26 @@ def get_mastery_data(champ_names, champ_images, version):
 
     if not isinstance(mastery_data, list):
         return {"error": "Le format des données de maîtrise renvoyées par le client est invalide."}, 502
+
+    _LAST_MASTERY_SNAPSHOT = {
+        item["championId"]: {
+            "championLevel": item["championLevel"],
+            "championPoints": item["championPoints"],
+            "championPointsUntilNextLevel": (
+                item["championPointsUntilNextLevel"]
+                if isinstance(item.get("championPointsUntilNextLevel"), int)
+                and not isinstance(item.get("championPointsUntilNextLevel"), bool)
+                and item["championPointsUntilNextLevel"] >= 0
+                else None
+            ),
+        }
+        for item in mastery_data
+        if isinstance(item, dict)
+        and all(
+            isinstance(item.get(field), int) and not isinstance(item.get(field), bool)
+            for field in ("championId", "championLevel", "championPoints")
+        )
+    }
 
     champions = []
     required_fields = (
@@ -266,14 +522,34 @@ def get_mastery_data(champ_names, champ_images, version):
         current_level = champion["championLevel"] if champion else 0
         current_points = champion["championPoints"] if champion else 0
         points_before_game = update["championPointsBeforeGame"]
+        if points_before_game is None:
+            points_before_game = update["_fallbackBeforeGamePoints"]
+        if points_before_game is None:
+            if (
+                champion
+                and not update["championLevelUp"]
+                and update["championPointsUntilNextLevelAfterGame"] is not None
+                and champion["championLevel"] == update["championLevel"]
+                and champion["xpRemaining"] == update["championPointsUntilNextLevelAfterGame"]
+            ):
+                del _PROVISIONAL_MASTERY_UPDATES[champion_id]
+                continue
+            points_before_game = current_points
+            update["_fallbackBeforeGamePoints"] = points_before_game
         expected_points = (
             points_before_game + update["championPointsGained"]
             if points_before_game is not None
-            else current_points + update["championPointsGained"]
+            else current_points
         )
-        already_synchronized = current_level >= update["championLevel"] and (
-            current_points >= expected_points or points_before_game is None
+        already_synchronized = (
+            current_level >= update["championLevel"]
+            and current_points >= expected_points
         )
+        if update.get("_isEstimated") and champion:
+            already_synchronized = already_synchronized or (
+                current_level > update["championLevel"]
+                or current_points > points_before_game
+            )
         if already_synchronized:
             del _PROVISIONAL_MASTERY_UPDATES[champion_id]
             continue
@@ -294,7 +570,8 @@ def get_mastery_data(champ_names, champ_images, version):
             champions.append(champion)
             champion_by_id[champion_id] = champion
         else:
-            champion["championLevel"] = update["championLevel"]
+            if not update.get("_isEstimated"):
+                champion["championLevel"] = update["championLevel"]
             champion["championPoints"] = expected_points
             if update["championPointsUntilNextLevelAfterGame"] is not None:
                 champion["xpRemaining"] = update["championPointsUntilNextLevelAfterGame"]
@@ -303,5 +580,8 @@ def get_mastery_data(champ_names, champ_images, version):
         champion["isProvisional"] = True
         champion["championPointsGained"] = update["championPointsGained"]
         champion["pointsIntoLevel"] = update["pointsIntoLevel"]
+        if update.get("_isEstimated"):
+            champion["isEstimated"] = True
+            champion["estimateSampleCount"] = update["_estimateSampleCount"]
 
     return {"champions": champions}, 200

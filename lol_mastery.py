@@ -78,6 +78,7 @@ MASTERY_HTML = """
         #mastery-root .card-info { display:flex; flex:1; flex-direction:column; align-items:center; gap:6px; min-width:0; }
         #mastery-root h2 { width:100%; overflow:hidden; margin:0; color:#93c5fd; font-size:.84rem; text-align:center; text-overflow:ellipsis; white-space:nowrap; }
         #mastery-root .level { display:grid; place-items:center; width:52px; height:52px; flex:none; border:1px solid currentColor; border-radius:50%; font-size:1.4rem; font-weight:800; }
+        #mastery-root .estimate-badge { padding:2px 6px; border:1px solid #a16207; border-radius:999px; background:#422006; color:#fde68a; font-size:.68rem; font-weight:750; }
         #mastery-root .mastery-level-basic { background:#334155; color:#cbd5e1; }
         #mastery-root .mastery-level-black { background:#020617; color:#f8fafc; }
         #mastery-root .mastery-level-green { background:#14532d; color:#4ade80; }
@@ -243,12 +244,19 @@ MASTERY_HTML = """
                 info.className = "card-info";
                 const title = document.createElement("h2");
                 title.textContent = champion.name;
-                info.append(title);
                 const level = document.createElement("span");
                 level.className = `level ${masteryLevelClass(champion.championLevel)}`;
                 level.textContent = champion.championLevel;
                 level.setAttribute("aria-label", `Niveau ${champion.championLevel}`);
                 level.title = `Niveau ${champion.championLevel}`;
+                if (champion.isEstimated) {
+                    const estimateBadge = document.createElement("span");
+                    estimateBadge.className = "estimate-badge";
+                    estimateBadge.textContent = "estimé";
+                    info.append(title, level, estimateBadge);
+                } else {
+                    info.append(title, level);
+                }
 
                 const detailsId = `mastery-details-${champion.championId}`;
                 const toggle = document.createElement("button");
@@ -260,7 +268,6 @@ MASTERY_HTML = """
                 toggle.title = `${isExpanded ? "Réduire" : "Afficher"} les détails de ${champion.name}`;
                 toggle.innerHTML = '<svg class="mastery-chevron" viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 6 4.5 4 4.5-4" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8"/></svg>';
                 toggle.addEventListener("click", () => toggleMasteryDetails(champion.championId));
-                info.append(title, level);
                 titleBlock.append(info);
                 heading.append(titleBlock, toggle);
 
@@ -295,6 +302,11 @@ MASTERY_HTML = """
                 const points = document.createElement("p");
                 points.textContent = `Points de maîtrise : ${champion.championPoints.toLocaleString("fr-FR")}`;
                 details.append(points);
+                if (champion.isEstimated) {
+                    const estimate = document.createElement("p");
+                    estimate.textContent = `Gain estimé : +${champion.championPointsGained.toLocaleString("fr-FR")} pts, calculé sur ${champion.estimateSampleCount} gains réels précédents. Niveau et jetons non estimés.`;
+                    details.append(estimate);
+                }
 
                 card.append(heading, details);
                 list.append(card);
@@ -392,11 +404,14 @@ MASTERY_HTML = """
         async function synchronizeMasteriesAfterMatch(previousSnapshot, generation, attempt = 1) {
             let postGameUpdateAvailable = false;
             let postGameUpdateError = null;
+            let estimatePending = null;
             try {
                 const updateResponse = await fetch("/post-game-mastery-update", {cache: "no-store"});
                 const updateData = await updateResponse.json();
                 if (!updateResponse.ok) throw new Error(updateData.error || `HTTP ${updateResponse.status}`);
                 postGameUpdateAvailable = updateData.available === true;
+                if (updateData.estimatePending) estimatePending = updateData;
+                if (updateData.warning) postGameUpdateError = updateData.warning;
             } catch (error) {
                 postGameUpdateError = error.message;
             }
@@ -415,14 +430,25 @@ MASTERY_HTML = """
                 postGameSyncTimer = null;
                 postGameSyncActive = false;
                 postGameSyncFinished = true;
-                gameflowStatusNode.textContent = hasProvisionalMastery
-                    ? "Le niveau reçu après la partie reste affiché localement, en attente de confirmation du client."
-                    : `Aucune mise à jour des maîtrises confirmée après 60 s.${postGameUpdateError ? ` ${postGameUpdateError}` : ""}`;
+                const estimatedChampion = champions.find(champion => champion.isEstimated);
+                if (estimatedChampion) {
+                    gameflowStatusNode.textContent = `${estimatedChampion.name} : gain estimé de +${estimatedChampion.championPointsGained.toLocaleString("fr-FR")} points (${estimatedChampion.estimateSampleCount} gains réels de référence). Niveau et jetons restent ceux du client.`;
+                } else if (hasProvisionalMastery) {
+                    gameflowStatusNode.textContent = "Le résultat de maîtrise reste affiché provisoirement, en attente de confirmation du client.";
+                } else if (estimatePending) {
+                    gameflowStatusNode.textContent = estimatePending.pendingReason === "missing-match-snapshot"
+                        ? `Gain réel indisponible : total de maîtrise avant-match manquant, estimation impossible pour cette partie.${postGameUpdateError ? ` ${postGameUpdateError}` : ""}`
+                        : `Gain réel indisponible : estimation en attente de ${estimatePending.requiredGainSamples} gains réels de référence (actuellement ${estimatePending.observedGainSamples}).${postGameUpdateError ? ` ${postGameUpdateError}` : ""}`;
+                } else {
+                    gameflowStatusNode.textContent = `Aucune mise à jour des maîtrises confirmée après 60 s.${postGameUpdateError ? ` ${postGameUpdateError}` : ""}`;
+                }
                 return;
             }
 
             const provisionalChampion = champions.find(champion => champion.isProvisional);
-            gameflowStatusNode.textContent = provisionalChampion
+            gameflowStatusNode.textContent = provisionalChampion?.isEstimated
+                ? `${provisionalChampion.name} : gain estimé provisoirement ; attente d’une valeur réelle du client… nouvelle lecture ${attempt}/${postGameSyncMaxAttempts} dans 2 s.`
+                : provisionalChampion
                 ? `${provisionalChampion.name} niveau ${provisionalChampion.championLevel} affiché provisoirement ; attente de synchronisation… nouvelle lecture ${attempt}/${postGameSyncMaxAttempts} dans 2 s.`
                 : `Synchronisation des maîtrises… nouvelle lecture ${attempt}/${postGameSyncMaxAttempts} dans 2 s.`;
             postGameSyncTimer = window.setTimeout(

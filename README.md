@@ -98,6 +98,7 @@ Le mode par défaut (sans argument) démarre le HUD, les maîtrises, le randomiz
 - Le mot de passe temporaire du fichier `lockfile` Riot sert à authentifier les requêtes locales à la LCU. Il n'est pas nécessaire de le copier dans la configuration de LoLMonitor. Ne le partagez pas, et ne partagez pas de journaux qui pourraient contenir des réponses du client.
 - Data Dragon fournit des données et images publiques. Le projet peut nécessiter Internet pour les récupérer; les appels à Data Dragon ne nécessitent pas les identifiants LCU.
 - Les préférences et l’état ON/OFF des automatismes sont enregistrés séparément dans `skin_prefs.json` (LoL) et `tft_prefs.json` (TFT), dans le répertoire de travail de l'application. Les automatismes sont actifs par défaut pour les préférences existantes. Ces fichiers sont créés ou mis à jour à l'utilisation et ne sont **pas** inclus dans l'archive de release. Conservez-en une copie si vous souhaitez sauvegarder favoris et préférences.
+- LoLMastery conserve jusqu’à 50 gains réels de maîtrise dans `%LOCALAPPDATA%\LoLMonitor\mastery_gain_samples.json` afin de calibrer une estimation médiane après trois gains. Les gains estimés sont marqués comme provisoires; ils ne changent ni niveau ni jetons et sont remplacés si le client fournit ensuite une valeur réelle.
 - Fermez l'application si vous ne souhaitez plus qu'elle interroge le client local.
 
 ## Dépannage
@@ -107,7 +108,7 @@ Le mode par défaut (sans argument) démarre le HUD, les maîtrises, le randomiz
 | La page ne s'ouvre pas | Vérifiez que la fenêtre de console est toujours ouverte et que le démarrage n'indique pas un port déjà utilisé. Essayez `http://127.0.0.1:5000`. |
 | Aucune donnée de partie | Démarrez une partie de League of Legends. Les données en direct ne sont pas disponibles dans le lobby. |
 | Bibliothèque ou maîtrises indisponibles | Vérifiez que le client Riot est ouvert, que vous êtes connecté et que le compte attendu est actif. |
-| Maîtrises inchangées après une partie | L’application utilise d’abord le résultat de maîtrise de fin de partie pour afficher provisoirement le niveau et les points gagnés, puis attend la confirmation de la LCU pendant environ 60 secondes. Si le résultat de fin de partie est indisponible, ou si la LCU ne confirme jamais, actualisez manuellement. |
+| Maîtrises inchangées après une partie | L’application utilise d’abord le résultat de maîtrise de fin de partie ou le delta réellement observé entre les totaux avant et après partie. Si aucune valeur réelle n’est disponible, elle attend trois gains réels enregistrés avant d’afficher une estimation provisoire; le niveau et les jetons ne sont jamais estimés. |
 | Images/noms manquants | Vérifiez votre connexion Internet et réessayez plus tard; ces ressources proviennent de Data Dragon. |
 | La sélection automatique ne fonctionne plus | Une mise à jour du client peut modifier la LCU. Consultez les journaux de la console et les notes de la release; ne partagez pas les réponses du client contenant des informations personnelles. |
 
@@ -224,6 +225,7 @@ With no argument, the default mode starts the HUD, masteries, League randomizer,
 - The temporary password in Riot's `lockfile` authenticates local LCU requests. You do not need to copy it into LoLMonitor's configuration. Do not share it or logs that may contain client responses.
 - Data Dragon provides public data and images. The project may need Internet access to retrieve them; Data Dragon requests do not require LCU credentials.
 - Preferences and the ON/OFF automation states are stored separately in `skin_prefs.json` (LoL) and `tft_prefs.json` (TFT) in the application's working directory. Automation defaults to ON for existing preference files. These files are created or updated during use and are **not** included in the release archive. Keep a backup if you want to preserve favorites and preferences.
+- LoLMastery stores up to 50 real mastery gains in `%LOCALAPPDATA%\LoLMonitor\mastery_gain_samples.json` to calibrate a median estimate after three gains. Estimates are marked provisional; they do not change level or tokens and are replaced if the client later provides a real value.
 - Close the app if you no longer want it to query the local client.
 
 ### Troubleshooting
@@ -233,7 +235,7 @@ With no argument, the default mode starts the HUD, masteries, League randomizer,
 | The page will not open | Make sure the console window is still open and check for a port-in-use error. Try `http://127.0.0.1:5000`. |
 | No match data | Start a League of Legends game. Live match data is unavailable in the lobby. |
 | Masteries or library unavailable | Make sure the Riot Client is open, signed in, and using the expected account. |
-| Masteries unchanged after a match | The app first uses the post-game mastery result to show the level and points gained provisionally, then waits about 60 seconds for the LCU to confirm. If the post-game result is unavailable or the LCU never confirms it, refresh manually. |
+| Masteries unchanged after a match | The app first uses the post-game mastery result or the actual before/after points delta. If no real value is available, it waits until three real gains have been recorded before showing a provisional estimate; level and tokens are never estimated. |
 | Missing images or names | Check your Internet connection and try again later; these resources come from Data Dragon. |
 | Automatic selection stopped working | A client update may have changed the LCU. Check the console output and release notes; do not share client responses that may contain personal information. |
 
