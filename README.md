@@ -107,6 +107,7 @@ Le mode par défaut (sans argument) démarre le HUD, les maîtrises, le randomiz
 | La page ne s'ouvre pas | Vérifiez que la fenêtre de console est toujours ouverte et que le démarrage n'indique pas un port déjà utilisé. Essayez `http://127.0.0.1:5000`. |
 | Aucune donnée de partie | Démarrez une partie de League of Legends. Les données en direct ne sont pas disponibles dans le lobby. |
 | Bibliothèque ou maîtrises indisponibles | Vérifiez que le client Riot est ouvert, que vous êtes connecté et que le compte attendu est actif. |
+| Maîtrises inchangées après une partie | L’application utilise d’abord le résultat de maîtrise de fin de partie pour afficher provisoirement le niveau et les points gagnés, puis attend la confirmation de la LCU pendant environ 60 secondes. Si le résultat de fin de partie est indisponible, ou si la LCU ne confirme jamais, actualisez manuellement. |
 | Images/noms manquants | Vérifiez votre connexion Internet et réessayez plus tard; ces ressources proviennent de Data Dragon. |
 | La sélection automatique ne fonctionne plus | Une mise à jour du client peut modifier la LCU. Consultez les journaux de la console et les notes de la release; ne partagez pas les réponses du client contenant des informations personnelles. |
 
@@ -232,6 +233,7 @@ With no argument, the default mode starts the HUD, masteries, League randomizer,
 | The page will not open | Make sure the console window is still open and check for a port-in-use error. Try `http://127.0.0.1:5000`. |
 | No match data | Start a League of Legends game. Live match data is unavailable in the lobby. |
 | Masteries or library unavailable | Make sure the Riot Client is open, signed in, and using the expected account. |
+| Masteries unchanged after a match | The app first uses the post-game mastery result to show the level and points gained provisionally, then waits about 60 seconds for the LCU to confirm. If the post-game result is unavailable or the LCU never confirms it, refresh manually. |
 | Missing images or names | Check your Internet connection and try again later; these resources come from Data Dragon. |
 | Automatic selection stopped working | A client update may have changed the LCU. Check the console output and release notes; do not share client responses that may contain personal information. |
 

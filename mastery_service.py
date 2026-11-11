@@ -8,6 +8,7 @@ LCU_LOCKFILE_CANDIDATES = [
     r"C:\Riot Games\League of Legends\lockfile",
     os.path.expanduser(r"~\AppData\Local\Riot Games\League of Legends\lockfile"),
 ]
+_PROVISIONAL_MASTERY_UPDATES = {}
 
 
 def load_champion_catalog():
@@ -104,6 +105,108 @@ def get_gameflow_phase():
     return {"phase": phase}, 200
 
 
+def _read_non_negative_int(data, *field_names):
+    value = next((data.get(field) for field in field_names if field in data), None)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        return None
+    return value
+
+
+def _normalize_post_game_mastery_update(data, champion_id, game_id):
+    if not isinstance(data, dict):
+        return None
+
+    update_game_id = _read_non_negative_int(data, "gameId")
+    updated_champion_id = _read_non_negative_int(data, "championId")
+    level = _read_non_negative_int(data, "championLevel", "level")
+    points_gained = _read_non_negative_int(data, "championPointsGained", "pointsGained")
+    points_before_game = _read_non_negative_int(data, "championPointsBeforeGame")
+    points_until_next_level = _read_non_negative_int(
+        data,
+        "championPointsUntilNextLevelAfterGame",
+        "pointsUntilNextLevelAfterGame",
+    )
+    points_until_next_level_before_game = _read_non_negative_int(
+        data,
+        "championPointsUntilNextLevelBeforeGame",
+    )
+    level_up = data.get("championLevelUp", data.get("hasLeveledUp"))
+
+    if (
+        update_game_id != game_id
+        or (updated_champion_id is not None and updated_champion_id != champion_id)
+        or level is None
+        or level < 1
+        or points_gained is None
+        or not isinstance(level_up, bool)
+    ):
+        return None
+
+    points_into_level = None
+    if level_up and points_until_next_level_before_game is not None:
+        points_into_level = max(0, points_gained - points_until_next_level_before_game + 1)
+
+    return {
+        "gameId": game_id,
+        "championId": champion_id,
+        "championLevel": level,
+        "championPointsBeforeGame": points_before_game,
+        "championPointsGained": points_gained,
+        "championPointsUntilNextLevelAfterGame": points_until_next_level,
+        "championLevelUp": level_up,
+        "pointsIntoLevel": points_into_level,
+    }
+
+
+def get_post_game_mastery_update():
+    stats_response, error = _get_lcu_response("/lol-end-of-game/v1/eog-stats-block")
+    if error:
+        return error
+    if stats_response.status_code in (204, 404):
+        return {"available": False}, 200
+    if stats_response.status_code != 200:
+        return {"error": f"Le client LoL a refusé la lecture des résultats (HTTP {stats_response.status_code})."}, 502
+
+    try:
+        stats = stats_response.json()
+    except ValueError:
+        return {"error": "Le client LoL a renvoyé des résultats de partie invalides."}, 502
+    if not isinstance(stats, dict):
+        return {"error": "Le format des résultats de partie renvoyés par le client est invalide."}, 502
+
+    game_id = _read_non_negative_int(stats, "gameId")
+    local_player = stats.get("localPlayer")
+    champion_id = _read_non_negative_int(local_player, "championId") if isinstance(local_player, dict) else None
+    if game_id is None or champion_id is None:
+        return {"available": False}, 200
+
+    mastery_response, error = _get_lcu_response(
+        "/lol-end-of-game/v1/champion-mastery-updates"
+    )
+    if error:
+        return error
+    if mastery_response.status_code in (204, 404):
+        return {"available": False}, 200
+    if mastery_response.status_code != 200:
+        return {"error": f"Le client LoL a refusé la lecture des gains de maîtrise (HTTP {mastery_response.status_code})."}, 502
+
+    try:
+        mastery_update = mastery_response.json()
+    except ValueError:
+        return {"error": "Le client LoL a renvoyé des gains de maîtrise invalides."}, 502
+
+    normalized_update = _normalize_post_game_mastery_update(
+        mastery_update,
+        champion_id,
+        game_id,
+    )
+    if normalized_update is None:
+        return {"available": False}, 200
+
+    _PROVISIONAL_MASTERY_UPDATES[champion_id] = normalized_update
+    return {"available": True, **normalized_update}, 200
+
+
 def get_mastery_data(champ_names, champ_images, version):
     response, error = _get_lcu_response(
         "/lol-champion-mastery/v1/local-player/champion-mastery"
@@ -156,5 +259,49 @@ def get_mastery_data(champ_names, champ_images, version):
             "markRequiredForNextLevel": marks_required,
             "tokensEarned": tokens_earned,
         })
+
+    champion_by_id = {champion["championId"]: champion for champion in champions}
+    for champion_id, update in list(_PROVISIONAL_MASTERY_UPDATES.items()):
+        champion = champion_by_id.get(champion_id)
+        current_level = champion["championLevel"] if champion else 0
+        current_points = champion["championPoints"] if champion else 0
+        points_before_game = update["championPointsBeforeGame"]
+        expected_points = (
+            points_before_game + update["championPointsGained"]
+            if points_before_game is not None
+            else current_points + update["championPointsGained"]
+        )
+        already_synchronized = current_level >= update["championLevel"] and (
+            current_points >= expected_points or points_before_game is None
+        )
+        if already_synchronized:
+            del _PROVISIONAL_MASTERY_UPDATES[champion_id]
+            continue
+
+        if champion is None:
+            champion = {
+                "championId": champion_id,
+                "name": champ_names.get(champion_id, f"ID LCU non reconnu ({champion_id})"),
+                "isRecognized": champion_id in champ_names,
+                "image": f"https://ddragon.leagueoflegends.com/cdn/{version}/img/champion/{champ_images[champion_id]}" if champion_id in champ_images else None,
+                "championLevel": update["championLevel"],
+                "championPoints": expected_points,
+                "xpRemaining": update["championPointsUntilNextLevelAfterGame"],
+                "hasNextLevel": bool(update["championPointsUntilNextLevelAfterGame"]),
+                "markRequiredForNextLevel": 0,
+                "tokensEarned": 0,
+            }
+            champions.append(champion)
+            champion_by_id[champion_id] = champion
+        else:
+            champion["championLevel"] = update["championLevel"]
+            champion["championPoints"] = expected_points
+            if update["championPointsUntilNextLevelAfterGame"] is not None:
+                champion["xpRemaining"] = update["championPointsUntilNextLevelAfterGame"]
+                champion["hasNextLevel"] = bool(champion["xpRemaining"]) or champion["markRequiredForNextLevel"] > 0
+
+        champion["isProvisional"] = True
+        champion["championPointsGained"] = update["championPointsGained"]
+        champion["pointsIntoLevel"] = update["pointsIntoLevel"]
 
     return {"champions": champions}, 200

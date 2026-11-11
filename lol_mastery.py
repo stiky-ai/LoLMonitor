@@ -3,7 +3,12 @@ import webbrowser
 
 from flask import Flask, jsonify, render_template_string
 
-from mastery_service import get_gameflow_phase, get_mastery_data, load_champion_catalog
+from mastery_service import (
+    get_gameflow_phase,
+    get_mastery_data,
+    get_post_game_mastery_update,
+    load_champion_catalog,
+)
 
 
 app = Flask(__name__)
@@ -149,6 +154,14 @@ MASTERY_HTML = """
         let matchInProgress = false;
         let gameflowPollInProgress = false;
         let masteryRefreshPending = false;
+        let matchMasterySnapshot = null;
+        let postGameSyncTimer = null;
+        let postGameSyncActive = false;
+        let postGameSyncFinished = false;
+        let postGameSyncGeneration = 0;
+        const postGameSyncInterval = 2000;
+        const postGameSyncMaxAttempts = 31;
+        const gameflowPollInterval = 2000;
         const statusNode = document.getElementById("status");
         const gameflowStatusNode = document.getElementById("gameflow-status");
         const list = document.getElementById("list");
@@ -256,6 +269,13 @@ MASTERY_HTML = """
                 details.id = detailsId;
                 details.hidden = !isExpanded;
                 if (champion.hasNextLevel) {
+                    if (Number.isInteger(champion.pointsIntoLevel) && Number.isInteger(champion.xpRemaining)) {
+                        const levelProgress = document.createElement("p");
+                        const pointsIntoLevel = champion.pointsIntoLevel;
+                        const levelThreshold = pointsIntoLevel + champion.xpRemaining;
+                        levelProgress.textContent = `Progression du niveau : ${pointsIntoLevel.toLocaleString("fr-FR")} / ${levelThreshold.toLocaleString("fr-FR")} pts`;
+                        details.append(levelProgress);
+                    }
                     const progress = document.createElement("p");
                     progress.append("XP restantes : ");
                     const xp = document.createElement("strong");
@@ -312,12 +332,25 @@ MASTERY_HTML = """
             render();
         }
 
+        function masterySnapshot() {
+            return JSON.stringify(champions
+                .map(champion => [
+                    champion.championId,
+                    champion.championLevel,
+                    champion.championPoints,
+                    champion.xpRemaining,
+                    champion.markRequiredForNextLevel,
+                    champion.tokensEarned
+                ])
+                .sort((a, b) => a[0] - b[0]));
+        }
+
         async function loadMasteries(forceRefresh = false) {
             statusNode.classList.remove("error");
             const refreshButton = document.getElementById("refresh");
             if (refreshButton.disabled) {
                 if (forceRefresh) masteryRefreshPending = true;
-                return;
+                return false;
             }
             statusNode.textContent = "Chargement des maîtrises…";
             refreshButton.disabled = true;
@@ -335,10 +368,18 @@ MASTERY_HTML = """
                 if (levels.some(level => level >= 10)) levelFilter.add(new Option("10+", "10+"));
                 statusNode.textContent = `${champions.length} champion(s) chargé(s).`;
                 render();
+                if (postGameSyncFinished && !matchInProgress) {
+                    const provisionalChampion = champions.find(champion => champion.isProvisional);
+                    gameflowStatusNode.textContent = provisionalChampion
+                        ? `${provisionalChampion.name} niveau ${provisionalChampion.championLevel} reste affiché provisoirement, en attente de confirmation du client.`
+                        : "Maîtrises rechargées manuellement.";
+                }
+                return true;
             } catch (error) {
                 statusNode.classList.add("error");
                 statusNode.textContent = error.message;
                 list.replaceChildren();
+                return false;
             } finally {
                 refreshButton.disabled = false;
                 if (masteryRefreshPending) {
@@ -346,6 +387,48 @@ MASTERY_HTML = """
                     loadMasteries(true);
                 }
             }
+        }
+
+        async function synchronizeMasteriesAfterMatch(previousSnapshot, generation, attempt = 1) {
+            let postGameUpdateAvailable = false;
+            let postGameUpdateError = null;
+            try {
+                const updateResponse = await fetch("/post-game-mastery-update", {cache: "no-store"});
+                const updateData = await updateResponse.json();
+                if (!updateResponse.ok) throw new Error(updateData.error || `HTTP ${updateResponse.status}`);
+                postGameUpdateAvailable = updateData.available === true;
+            } catch (error) {
+                postGameUpdateError = error.message;
+            }
+
+            const refreshed = await loadMasteries(true);
+            if (generation !== postGameSyncGeneration) return;
+            const hasProvisionalMastery = champions.some(champion => champion.isProvisional);
+            if (refreshed && !hasProvisionalMastery && (postGameUpdateAvailable || masterySnapshot() !== previousSnapshot)) {
+                postGameSyncTimer = null;
+                postGameSyncActive = false;
+                postGameSyncFinished = true;
+                gameflowStatusNode.textContent = "Maîtrises synchronisées après la partie.";
+                return;
+            }
+            if (attempt >= postGameSyncMaxAttempts) {
+                postGameSyncTimer = null;
+                postGameSyncActive = false;
+                postGameSyncFinished = true;
+                gameflowStatusNode.textContent = hasProvisionalMastery
+                    ? "Le niveau reçu après la partie reste affiché localement, en attente de confirmation du client."
+                    : `Aucune mise à jour des maîtrises confirmée après 60 s.${postGameUpdateError ? ` ${postGameUpdateError}` : ""}`;
+                return;
+            }
+
+            const provisionalChampion = champions.find(champion => champion.isProvisional);
+            gameflowStatusNode.textContent = provisionalChampion
+                ? `${provisionalChampion.name} niveau ${provisionalChampion.championLevel} affiché provisoirement ; attente de synchronisation… nouvelle lecture ${attempt}/${postGameSyncMaxAttempts} dans 2 s.`
+                : `Synchronisation des maîtrises… nouvelle lecture ${attempt}/${postGameSyncMaxAttempts} dans 2 s.`;
+            postGameSyncTimer = window.setTimeout(
+                () => synchronizeMasteriesAfterMatch(previousSnapshot, generation, attempt + 1),
+                postGameSyncInterval
+            );
         }
 
         async function checkGameflow() {
@@ -358,14 +441,35 @@ MASTERY_HTML = """
                 if (typeof data.phase !== "string") throw new Error("Format d’état de partie invalide.");
 
                 if (data.phase === "InProgress") {
+                    if (!matchInProgress) {
+                        matchMasterySnapshot = masterySnapshot();
+                        postGameSyncActive = false;
+                        postGameSyncFinished = false;
+                        postGameSyncGeneration++;
+                        if (postGameSyncTimer !== null) {
+                            window.clearTimeout(postGameSyncTimer);
+                            postGameSyncTimer = null;
+                        }
+                    }
                     matchInProgress = true;
                 } else if (matchInProgress && data.phase === "WaitingForStats") {
-                    gameflowStatusNode.textContent = "Partie terminée : synchronisation des résultats…";
+                    if (!postGameSyncActive && !postGameSyncFinished) {
+                        postGameSyncActive = true;
+                        const generation = ++postGameSyncGeneration;
+                        gameflowStatusNode.textContent = "Partie terminée : lecture des gains de maîtrise et synchronisation…";
+                        synchronizeMasteriesAfterMatch(matchMasterySnapshot, generation);
+                    }
                 } else if (matchInProgress) {
                     matchInProgress = false;
-                    gameflowStatusNode.textContent = "Fin de partie détectée : actualisation des maîtrises…";
-                    loadMasteries(true);
-                } else {
+                    const previousSnapshot = matchMasterySnapshot;
+                    matchMasterySnapshot = null;
+                    if (!postGameSyncActive && !postGameSyncFinished) {
+                        postGameSyncActive = true;
+                        const generation = ++postGameSyncGeneration;
+                        gameflowStatusNode.textContent = "Fin de partie détectée : synchronisation des maîtrises…";
+                        synchronizeMasteriesAfterMatch(previousSnapshot, generation);
+                    }
+                } else if (!postGameSyncActive && !postGameSyncFinished) {
                     gameflowStatusNode.textContent = "Actualisation automatique à la fin d’une partie LoL.";
                 }
             } catch (error) {
@@ -389,7 +493,7 @@ MASTERY_HTML = """
         });
         loadMasteries();
         checkGameflow();
-        window.setInterval(checkGameflow, 10000);
+        window.setInterval(checkGameflow, gameflowPollInterval);
     </script>
 </body>
 </html>
@@ -404,6 +508,14 @@ def index():
 @app.route("/mastery")
 def mastery():
     payload, status = get_mastery_data(CHAMP_NAMES, CHAMP_IMAGES, DD_VERSION)
+    response = jsonify(payload)
+    response.headers["Cache-Control"] = "no-store"
+    return response, status
+
+
+@app.route("/post-game-mastery-update")
+def post_game_mastery_update():
+    payload, status = get_post_game_mastery_update()
     response = jsonify(payload)
     response.headers["Cache-Control"] = "no-store"
     return response, status
